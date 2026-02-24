@@ -7,15 +7,12 @@
  * - No request logging of user data or messages.
  */
 
-const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
+const { app, ALLOWED_ORIGINS } = require('./app');
 const { registerHandlers } = require('./handlers');
-const { getSessionCount, setExpireHandler } = require('./sessions');
+const { setExpireHandler } = require('./sessions');
 const {
-  getQueueSize,
-  getRoomCount,
   leaveQueue,
   getRoomBySessionId,
   getPeerSocketId,
@@ -26,31 +23,6 @@ const { clearLimit } = require('./rateLimiter');
 const { REDIS_URL, getRedisAdapterClients } = require('./redisClient');
 
 const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGINS = (() => {
-  const raw = process.env.CORS_ORIGIN;
-  if (!raw) return '*';
-  const list = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  return list.length ? list : '*';
-})();
-
-// --- Express Setup ---
-const app = express();
-app.use(cors({ origin: ALLOWED_ORIGINS }));
-app.use(express.json({ limit: '10mb' }));
-
-/**
- * Health check endpoint.
- * Returns only aggregate counts - no session IDs, no user data.
- */
-app.get('/health', async (req, res) => {
-  res.json({
-    status: 'ok',
-    uptime: process.uptime(),
-    activeSessions: await getSessionCount(),
-    waitingInQueue: await getQueueSize(),
-    activeRooms: await getRoomCount(),
-  });
-});
 
 // --- HTTP Server ---
 const server = http.createServer(app);
