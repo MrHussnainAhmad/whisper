@@ -7,11 +7,16 @@
  * - No request logging of user data or messages.
  */
 
+require('dotenv').config();
+
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const { app, ALLOWED_ORIGINS } = require('./app');
 const { registerHandlers } = require('./handlers');
-const { setExpireHandler } = require('./sessions');
+const { requireSecureSocket, ENFORCE_HTTPS } = require('./security');
+const { addSession, removeSession, setExpireHandler } = require('./sessions');
+const { acquireConnection, refreshConnections, releaseConnection } = require('./abuseLimiter');
 const {
   leaveQueue,
   getRoomBySessionId,
@@ -19,13 +24,16 @@ const {
   destroyRoom,
 } = require('./matchmaking');
 const { cancelInvite } = require('./invites');
-const { clearLimit } = require('./rateLimiter');
-const { REDIS_URL, getRedisAdapterClients } = require('./redisClient');
+const { REDIS_URL, getRedisAdapterClients, verifyEphemeralRedisConfiguration } = require('./redisClient');
 
 const PORT = process.env.PORT || 3000;
 
 // --- HTTP Server ---
 const server = http.createServer(app);
+server.headersTimeout = 15_000;
+server.requestTimeout = 20_000;
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 100;
 
 // --- Socket.IO Setup ---
 const io = new Server(server, {
@@ -33,7 +41,7 @@ const io = new Server(server, {
     origin: ALLOWED_ORIGINS, // Set via CORS_ORIGIN in production
     methods: ['GET', 'POST'],
   },
-  maxHttpBufferSize: 30 * 1024 * 1024, // 30MB max for media payloads
+  maxHttpBufferSize: 6 * 1024 * 1024,
   pingTimeout: 30000,
   pingInterval: 25000,
 });
@@ -66,27 +74,75 @@ async function handleExpiredSessions(expired) {
       const peerSocketId = await getPeerSocketId(activeRoomId, sessionId);
       if (peerSocketId) {
         io.to(peerSocketId).emit('chat-ended', {
-          reason: 'The other person has left.',
+          reasonCode: 'session_expired',
         });
       }
       await destroyRoom(activeRoomId);
     }
-
-    await clearLimit(sessionId);
   }
 }
 
 setExpireHandler(handleExpiredSessions);
 
+io.use(requireSecureSocket);
+
+io.use(async (socket, next) => {
+  try {
+    if (!(await acquireConnection(socket))) return next(new Error('Too many connections'));
+    return next();
+  } catch (err) {
+    console.error('Connection admission failed:', err?.message || err);
+    return next(new Error('Connection rejected'));
+  }
+});
+
 /**
  * On each new WebSocket connection, register all event handlers.
  */
-io.on('connection', (socket) => {
-  registerHandlers(io, socket);
+io.on('connection', async (socket) => {
+  let released = false;
+  socket.on('disconnect', () => {
+    if (released) return;
+    released = true;
+    releaseConnection(socket).catch((err) => {
+      console.error('Connection lease release failed:', err?.message || err);
+    });
+  });
+
+  const sessionId = crypto.randomUUID();
+  try {
+    await addSession(sessionId, socket.id);
+    if (!socket.connected) {
+      await removeSession(sessionId);
+      return;
+    }
+    socket.sessionId = sessionId;
+    socket.chatVerified = false;
+    registerHandlers(io, socket);
+    socket.emit('joined', { status: 'ok' });
+  } catch (err) {
+    console.error('Session initialization failed:', err?.message || err);
+    socket.disconnect(true);
+  }
 });
 
+let leaseRefreshRunning = false;
+const connectionLeaseTimer = setInterval(() => {
+  if (leaseRefreshRunning) return;
+  leaseRefreshRunning = true;
+  refreshConnections(io.sockets.sockets.values())
+    .catch((err) => console.error('Connection lease refresh failed:', err?.message || err))
+    .finally(() => { leaseRefreshRunning = false; });
+}, 30_000);
+connectionLeaseTimer.unref();
+
 async function start() {
+  if (process.env.NODE_ENV === 'production' && !REDIS_URL) {
+    throw new Error('REDIS_URL is required in production for atomic invites, shared sessions, and rate limits');
+  }
+
   if (REDIS_URL) {
+    await verifyEphemeralRedisConfiguration();
     let createAdapter;
     try {
       ({ createAdapter } = require('@socket.io/redis-adapter'));
@@ -101,7 +157,12 @@ async function start() {
 
   server.listen(PORT, () => {
     console.log(`Anonymous Chat Backend running on port ${PORT}`);
-    console.log('Privacy mode: all data in RAM only. No persistence.');
+    console.log(REDIS_URL
+      ? 'Privacy mode: Redis persistence is verified in production.'
+      : 'Privacy mode: ephemeral process memory only (dev).');
+    if (ENFORCE_HTTPS) {
+      console.log('HTTPS enforcement: ON');
+    }
   });
 }
 

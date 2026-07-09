@@ -36,8 +36,31 @@ async function getRedisAdapterClients() {
   return { pubClient, subClient };
 }
 
+async function verifyEphemeralRedisConfiguration() {
+  if (!REDIS_URL || process.env.NODE_ENV !== 'production') return;
+  if (process.env.REDIS_REQUIRE_EPHEMERAL !== 'true') {
+    throw new Error('REDIS_REQUIRE_EPHEMERAL=true is required for production Redis');
+  }
+
+  const client = await getRedisClient();
+  let appendOnly;
+  let save;
+  try {
+    const aofConfig = await client.configGet('appendonly');
+    const saveConfig = await client.configGet('save');
+    appendOnly = aofConfig.appendonly;
+    save = saveConfig.save;
+  } catch {
+    throw new Error('Cannot verify Redis persistence settings; CONFIG GET must be permitted');
+  }
+  if (String(appendOnly).toLowerCase() !== 'no' || String(save || '').trim() !== '') {
+    throw new Error('Redis persistence must be disabled (appendonly=no and save="")');
+  }
+}
+
 module.exports = {
   REDIS_URL,
   getRedisClient,
   getRedisAdapterClients,
+  verifyEphemeralRedisConfiguration,
 };
