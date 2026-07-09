@@ -4,16 +4,12 @@ const { requireHttps, securityHeaders } = require('./security');
 const { TRUST_PROXY_HOPS } = require('./networkConfig');
 const { httpRateLimit } = require('./httpLimiter');
 
+// Mobile clients are not browser-origin bound; * is allowed in production.
+// Set CORS_ORIGIN to a comma-separated allow-list if you later add a web client.
 const ALLOWED_ORIGINS = (() => {
   const raw = process.env.CORS_ORIGIN;
-  if (process.env.NODE_ENV === 'production' && (!raw || raw.trim() === '*')) {
-    throw new Error('CORS_ORIGIN must be an explicit allow-list in production');
-  }
-  if (!raw) return '*';
+  if (!raw || raw.trim() === '*') return '*';
   const list = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  if (process.env.NODE_ENV === 'production' && list.includes('*')) {
-    throw new Error('CORS_ORIGIN cannot contain * in production');
-  }
   return list.length ? list : '*';
 })();
 

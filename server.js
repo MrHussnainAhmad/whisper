@@ -38,7 +38,7 @@ server.maxRequestsPerSocket = 100;
 // --- Socket.IO Setup ---
 const io = new Server(server, {
   cors: {
-    origin: ALLOWED_ORIGINS, // Set via CORS_ORIGIN in production
+    origin: ALLOWED_ORIGINS, // CORS_ORIGIN; * allowed for mobile clients
     methods: ['GET', 'POST'],
   },
   maxHttpBufferSize: 6 * 1024 * 1024,
