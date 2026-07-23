@@ -2,14 +2,21 @@ const crypto = require('crypto');
 
 const MESSAGE_TTL_MS = 90 * 1000;
 const CAPTCHA_TTL_MS = 2 * 60 * 1000;
+const CAPTCHA_REFRESH_MS = 15 * 1000;
+const CAPTCHA_QUESTION_COUNT = CAPTCHA_TTL_MS / CAPTCHA_REFRESH_MS;
+const POW_DIFFICULTY_BITS = (() => {
+  const value = Number(process.env.GROUP_POW_DIFFICULTY_BITS || 12);
+  if (!Number.isInteger(value) || value < 4 || value > 20) {
+    throw new Error('GROUP_POW_DIFFICULTY_BITS must be an integer from 4 to 20');
+  }
+  return value;
+})();
 const MAX_GROUP_USERS = 500;
-const MAX_GROUP_MESSAGES = 300;
 const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 const MESSAGE_MAX_CHARS = 1000;
 
 const participants = new Map();
 const usernames = new Map();
-const messages = [];
 const challenges = new Map();
 let idleShutdownTimer = null;
 let groupActive = false;
@@ -28,9 +35,7 @@ function usernameKey(username) {
 }
 
 function pruneMessages() {
-  const cutoff = now();
-  while (messages.length && messages[0].expiresAt <= cutoff) messages.shift();
-  while (messages.length > MAX_GROUP_MESSAGES) messages.shift();
+  // Group messages are live relay-only and are never retained by the backend.
 }
 
 function pruneChallenges() {
@@ -51,7 +56,6 @@ function destroyIdleGroupState() {
   if (participants.size > 0) return;
   groupActive = false;
   usernames.clear();
-  messages.length = 0;
   challenges.clear();
   groupStatusListener?.(getGroupStatus());
 }
@@ -65,23 +69,53 @@ function scheduleIdleShutdown() {
 function createCaptcha() {
   cancelIdleShutdown();
   pruneChallenges();
-  const left = crypto.randomInt(2, 10);
-  const right = crypto.randomInt(2, 10);
   const id = crypto.randomUUID();
+  const powNonce = crypto.randomBytes(16).toString('hex');
+  const questions = Array.from({ length: CAPTCHA_QUESTION_COUNT }, () => {
+    const left = crypto.randomInt(2, 10);
+    const right = crypto.randomInt(2, 10);
+    return { question: `${left} + ${right}`, answer: String(left + right) };
+  });
   challenges.set(id, {
-    answer: String(left + right),
+    answers: questions.map((entry) => entry.answer),
+    powNonce,
+    powDifficultyBits: POW_DIFFICULTY_BITS,
     expiresAt: now() + CAPTCHA_TTL_MS,
   });
-  return { id, question: `${left} + ${right}` };
+  return {
+    id,
+    question: questions[0].question,
+    questions: questions.map((entry) => entry.question),
+    refreshEveryMs: CAPTCHA_REFRESH_MS,
+    powNonce,
+    powDifficultyBits: POW_DIFFICULTY_BITS,
+  };
 }
 
-function consumeCaptcha(id, answer) {
+function hasLeadingZeroBits(buffer, bits) {
+  const fullBytes = Math.floor(bits / 8);
+  for (let index = 0; index < fullBytes; index += 1) {
+    if (buffer[index] !== 0) return false;
+  }
+  const remainder = bits % 8;
+  return remainder === 0 || (buffer[fullBytes] & (0xff << (8 - remainder))) === 0;
+}
+
+function consumeCaptcha(id, answer, questionIndex = 0, powSolution) {
   pruneChallenges();
   if (typeof id !== 'string' || typeof answer !== 'string') return false;
   const challenge = challenges.get(id);
   if (!challenge) return false;
+  const index = Number(questionIndex);
+  const solution = Number(powSolution);
+  if (!Number.isInteger(index) || index < 0 || index >= challenge.answers.length) return false;
+  if (!Number.isSafeInteger(solution) || solution < 0 || solution > 1_000_000) return false;
+  const proof = crypto.createHash('sha512')
+    .update(`${id}|${challenge.powNonce}|${solution}`)
+    .digest();
+  if (!hasLeadingZeroBits(proof, challenge.powDifficultyBits)) return false;
   challenges.delete(id);
-  return challenge.answer === answer.trim();
+  return challenge.answers[index] === answer.trim();
 }
 
 function validateUsername(username) {
@@ -139,6 +173,12 @@ function getActiveCount() {
   return participants.size;
 }
 
+function getCurrentUsers() {
+  return [...participants.values()]
+    .map((participant) => participant.username)
+    .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+}
+
 function getGroupStatus() {
   return { activeUsers: participants.size, isActive: groupActive };
 }
@@ -148,10 +188,7 @@ function setGroupStatusListener(listener) {
 }
 
 function getRecentMessages() {
-  pruneMessages();
-  return messages
-    .filter((message) => !message.private)
-    .map((message) => ({ ...message }));
+  return [];
 }
 
 function extractMentions(text) {
@@ -196,8 +233,6 @@ function addMessage(sessionId, text) {
     createdAt,
     expiresAt: createdAt + MESSAGE_TTL_MS,
   };
-  if (!message.private) messages.push(message);
-  pruneMessages();
   return {
     ok: true,
     message: { ...message },
@@ -221,6 +256,7 @@ module.exports = {
   leaveGroup,
   getParticipant,
   getActiveCount,
+  getCurrentUsers,
   getGroupStatus,
   setGroupStatusListener,
   getRecentMessages,

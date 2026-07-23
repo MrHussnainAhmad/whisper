@@ -3,6 +3,7 @@
  * logged or persisted. */
 const { normalizeSource } = require('./abuseLimiter');
 const crypto = require('crypto');
+const { recordSecurityEvent } = require('./securityMonitor');
 
 const WINDOW_MS = 60_000;
 function positiveIntegerEnv(name, fallback) {
@@ -25,6 +26,7 @@ function httpRateLimit(req, res, next) {
   const now = Date.now();
   ({ entry: globalWindow } = take(globalWindow, GLOBAL_LIMIT, now));
   if (globalWindow.count > GLOBAL_LIMIT) {
+    recordSecurityEvent('http-global-limit');
     res.setHeader('Retry-After', '60');
     return res.status(429).json({ error: 'Too many requests' });
   }
@@ -35,6 +37,7 @@ function httpRateLimit(req, res, next) {
   const result = take(sources.get(source), SOURCE_LIMIT, now);
   sources.set(source, result.entry);
   if (!result.allowed) {
+    recordSecurityEvent('http-source-limit');
     res.setHeader('Retry-After', '60');
     return res.status(429).json({ error: 'Too many requests' });
   }

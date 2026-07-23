@@ -4,6 +4,7 @@ const proxyaddr = require('proxy-addr');
 const ipaddr = require('ipaddr.js');
 const { REDIS_URL, getRedisClient } = require('./redisClient');
 const { TRUST_PROXY_HOPS } = require('./networkConfig');
+const { recordSecurityEvent } = require('./securityMonitor');
 
 const USE_REDIS = !!REDIS_URL;
 function positiveIntegerEnv(name, fallback) {
@@ -12,10 +13,12 @@ function positiveIntegerEnv(name, fallback) {
   return value;
 }
 const MAX_CONNECTIONS_PER_SOURCE = positiveIntegerEnv('MAX_CONNECTIONS_PER_SOURCE', 24);
+const MAX_CONNECTIONS_GLOBAL = positiveIntegerEnv('MAX_CONNECTIONS_GLOBAL', 5000);
 const CONNECTION_LEASE_MS = 90_000;
 
 const counters = new Map();
 const connections = new Map();
+const globalConnections = new Set();
 
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -58,10 +61,18 @@ async function acquireConnection(socket) {
   socket.data.connectionLeaseActive = false;
 
   if (!USE_REDIS) {
+    if (globalConnections.size >= MAX_CONNECTIONS_GLOBAL) {
+      recordSecurityEvent('connection-global-limit');
+      return false;
+    }
     let sourceMembers = connections.get(sourceKey);
     if (!sourceMembers) sourceMembers = new Set();
-    if (sourceMembers.size >= MAX_CONNECTIONS_PER_SOURCE) return false;
+    if (sourceMembers.size >= MAX_CONNECTIONS_PER_SOURCE) {
+      recordSecurityEvent('connection-source-limit');
+      return false;
+    }
     sourceMembers.add(member);
+    globalConnections.add(member);
     connections.set(sourceKey, sourceMembers);
     socket.data.connectionLeaseActive = true;
     return true;
@@ -72,19 +83,28 @@ async function acquireConnection(socket) {
   const expiresAt = now + CONNECTION_LEASE_MS;
   const accepted = await client.eval(
     `redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+     redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+     if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[4]) then return -1 end
      if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
-     redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
-     redis.call('PEXPIRE', KEYS[1], ARGV[5])
+     redis.call('ZADD', KEYS[1], ARGV[5], ARGV[2])
+     redis.call('ZADD', KEYS[2], ARGV[5], ARGV[2])
+     redis.call('PEXPIRE', KEYS[1], ARGV[6])
+     redis.call('PEXPIRE', KEYS[2], ARGV[6])
      return 1`,
     {
-      keys: [`abuse:connections:source:${sourceKey}`],
+      keys: [`abuse:connections:source:${sourceKey}`, 'abuse:connections:global'],
       arguments: [
-        String(now), String(expiresAt), String(MAX_CONNECTIONS_PER_SOURCE),
-        member, String(CONNECTION_LEASE_MS * 2),
+        String(now), member, String(MAX_CONNECTIONS_PER_SOURCE),
+        String(MAX_CONNECTIONS_GLOBAL), String(expiresAt), String(CONNECTION_LEASE_MS * 2),
       ],
     }
   );
   socket.data.connectionLeaseActive = Number(accepted) === 1;
+  if (!socket.data.connectionLeaseActive) {
+    recordSecurityEvent(Number(accepted) === -1
+      ? 'connection-global-limit'
+      : 'connection-source-limit');
+  }
   return socket.data.connectionLeaseActive;
 }
 
@@ -99,6 +119,8 @@ async function refreshConnection(socket) {
   const multi = client.multi();
   multi.zAdd(`abuse:connections:source:${sourceKey}`, [{ score: expiresAt, value: member }]);
   multi.pExpire(`abuse:connections:source:${sourceKey}`, CONNECTION_LEASE_MS * 2);
+  multi.zAdd('abuse:connections:global', [{ score: expiresAt, value: member }]);
+  multi.pExpire('abuse:connections:global', CONNECTION_LEASE_MS * 2);
   await multi.exec();
 }
 
@@ -126,6 +148,11 @@ async function refreshConnections(sockets) {
     multi.zAdd(sourceKey, entries);
     multi.pExpire(sourceKey, CONNECTION_LEASE_MS * 2);
   }
+  multi.zAdd('abuse:connections:global', active.map((socket) => ({
+    score: expiresAt,
+    value: socket.data.connectionLeaseMember,
+  })));
+  multi.pExpire('abuse:connections:global', CONNECTION_LEASE_MS * 2);
   await multi.exec();
 }
 
@@ -138,12 +165,16 @@ async function releaseConnection(socket) {
   if (!USE_REDIS) {
     const sourceMembers = connections.get(sourceKey);
     sourceMembers?.delete(member);
+    globalConnections.delete(member);
     if (sourceMembers?.size === 0) connections.delete(sourceKey);
     return;
   }
 
   const client = await getRedisClient();
-  await client.zRem(`abuse:connections:source:${sourceKey}`, member);
+  const multi = client.multi();
+  multi.zRem(`abuse:connections:source:${sourceKey}`, member);
+  multi.zRem('abuse:connections:global', member);
+  await multi.exec();
 }
 
 function consumeMemory(bucket, identity, limit, windowMs, cost = 1) {
@@ -171,8 +202,13 @@ async function allowAction(socket, action, options = {}) {
   if (!sourceKey || !sessionId || !Number.isFinite(cost) || cost < 1) return false;
 
   if (!USE_REDIS) {
-    if (!consumeMemory(`${action}:source`, sourceKey, sourceLimit, windowMs, cost)) return false;
-    return consumeMemory(`${action}:session`, sessionId, limit, windowMs, cost);
+    if (!consumeMemory(`${action}:source`, sourceKey, sourceLimit, windowMs, cost)) {
+      recordSecurityEvent('socket-rate-limited');
+      return false;
+    }
+    const allowed = consumeMemory(`${action}:session`, sessionId, limit, windowMs, cost);
+    if (!allowed) recordSecurityEvent('socket-rate-limited');
+    return allowed;
   }
 
   const client = await getRedisClient();
@@ -191,7 +227,9 @@ async function allowAction(socket, action, options = {}) {
       ],
     }
   );
-  return Number(result) === 1;
+  const allowed = Number(result) === 1;
+  if (!allowed) recordSecurityEvent('socket-rate-limited');
+  return allowed;
 }
 
 module.exports = {

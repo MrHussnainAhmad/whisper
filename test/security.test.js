@@ -1,14 +1,17 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const net = require('node:net');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { before, after, test } = require('node:test');
 const { io } = require('socket.io-client');
 
-const { isValidPublicKey, isValidBase64 } = require('../validation');
+const { isValidMessageId, isValidPublicKey, isValidBase64 } = require('../validation');
 const { isValidInviteLocator } = require('../inviteRateLimiter');
 const { createInvite, getInvite, consumeInvite } = require('../invites');
 const { normalizeSource } = require('../abuseLimiter');
+const { createOriginPolicy } = require('../corsPolicy');
+const { recordSecurityEvent, takeSecuritySnapshot } = require('../securityMonitor');
 const { addSession, removeSession } = require('../sessions');
 const { _setRoom, getPeerSocketId, destroyRoom } = require('../matchmaking');
 
@@ -55,6 +58,24 @@ function solveCaptcha(captcha) {
   return String(Number(match[1]) + Number(match[2]));
 }
 
+function solveProofOfWork(captcha) {
+  for (let solution = 0; solution <= 1_000_000; solution += 1) {
+    const digest = crypto.createHash('sha512')
+      .update(`${captcha.id}|${captcha.powNonce}|${solution}`)
+      .digest();
+    const bits = captcha.powDifficultyBits;
+    const fullBytes = Math.floor(bits / 8);
+    let valid = true;
+    for (let index = 0; index < fullBytes; index += 1) {
+      if (digest[index] !== 0) valid = false;
+    }
+    const remainder = bits % 8;
+    if (valid && (remainder === 0 ||
+        (digest[fullBytes] & (0xff << (8 - remainder))) === 0)) return solution;
+  }
+  throw new Error('Could not solve proof of work');
+}
+
 before(async () => {
   const port = await getFreePort();
   serverUrl = `http://127.0.0.1:${port}`;
@@ -67,6 +88,7 @@ before(async () => {
       TRUST_PROXY: '0',
       REDIS_URL: '',
       VALKEY_URL: '',
+      GROUP_POW_DIFFICULTY_BITS: '4',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -93,6 +115,14 @@ test('strict key and ciphertext validation rejects malformed inputs', () => {
   assert.equal(isValidBase64('AAAA', 16), true);
   assert.equal(isValidBase64('AAAA!', 16), false);
   assert.equal(isValidBase64('A'.repeat(20), 16), false);
+});
+
+test('message identifiers and aggregate monitoring reject identifying fields', () => {
+  assert.equal(isValidMessageId('20000000-0000-4000-8000-000000000002'), true);
+  assert.equal(isValidMessageId('not-a-message-id'), false);
+  recordSecurityEvent('invalid-encrypted-payload');
+  recordSecurityEvent('contains_private_value@example.com');
+  assert.deepEqual(takeSecuritySnapshot(), { 'invalid-encrypted-payload': 1 });
 });
 
 test('invite locators are single-consumer while the authentication secret stays client-side', async () => {
@@ -127,6 +157,14 @@ test('spoofed forwarded protocol is ignored when no proxy is trusted', () => {
   if (oldTrustProxy === undefined) delete process.env.TRUST_PROXY;
   else process.env.TRUST_PROXY = oldTrustProxy;
   delete require.cache[require.resolve('../security')];
+});
+
+test('production browser origins must use an explicit allow-list', () => {
+  assert.throws(() => createOriginPolicy('*', 'production'), /explicit/i);
+  const policy = createOriginPolicy('https://whisperchatapp.duckdns.org', 'production');
+  assert.equal(policy.allows(undefined), true);
+  assert.equal(policy.allows('https://whisperchatapp.duckdns.org'), true);
+  assert.equal(policy.allows('https://evil.example'), false);
 });
 
 test('self-redemption does not destroy an invite and control fields are allow-listed', async () => {
@@ -182,6 +220,21 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     const verified = await new Promise((resolve) => inviter.emit('verify-chat', resolve));
     assert.deepEqual(verified, { ok: true });
 
+    const messageId = '20000000-0000-4000-8000-000000000002';
+    const relayedMessage = once(joiner, 'receive-encrypted');
+    const firstRelay = await emitAck(inviter, 'send-encrypted', {
+      messageId,
+      encrypted: 'AAAA',
+    });
+    assert.deepEqual(firstRelay, { ok: true, messageId, duplicate: false });
+    assert.deepEqual(await relayedMessage, { encrypted: 'AAAA', messageId });
+
+    const duplicateRelay = await emitAck(inviter, 'send-encrypted', {
+      messageId,
+      encrypted: 'AAAA',
+    });
+    assert.deepEqual(duplicateRelay, { ok: true, messageId, duplicate: true });
+
     const typingPromise = once(joiner, 'peer-typing');
     inviter.emit('typing', { active: true, injected: 'removed' });
     assert.deepEqual(await typingPromise, { active: true });
@@ -227,26 +280,43 @@ test('room routing never falls back to a stale socket ID', async () => {
   }
 });
 
-test('global group chat uses temporary unique usernames and short-lived history', async () => {
+test('random matchmaking always acknowledges the resulting UI state', async () => {
+  const client = await connectClient();
+  try {
+    const result = await emitAck(client, 'find-random', {});
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 'waiting');
+  } finally {
+    client.emit('cancel-search');
+    client.disconnect();
+  }
+});
+
+test('global group chat uses temporary unique usernames and retains no history', async () => {
   const first = await connectClient();
   const second = await connectClient();
   const third = await connectClient();
   try {
     const firstCaptcha = (await emitAck(first, 'group-captcha')).captcha;
+    assert.equal(firstCaptcha.refreshEveryMs, 15_000);
+    assert.equal(firstCaptcha.questions.length, 8);
     const firstJoin = await emitAck(first, 'join-group', {
       username: 'Alice',
       captchaId: firstCaptcha.id,
       captchaAnswer: solveCaptcha(firstCaptcha),
+      powSolution: solveProofOfWork(firstCaptcha),
     });
     assert.equal(firstJoin.ok, true);
     assert.equal(firstJoin.username, 'Alice');
     assert.equal(firstJoin.messageTtlMs, 90_000);
+    assert.deepEqual(firstJoin.users, ['Alice']);
 
     const duplicateCaptcha = (await emitAck(second, 'group-captcha')).captcha;
     const duplicateJoin = await emitAck(second, 'join-group', {
       username: 'alice',
       captchaId: duplicateCaptcha.id,
       captchaAnswer: solveCaptcha(duplicateCaptcha),
+      powSolution: solveProofOfWork(duplicateCaptcha),
     });
     assert.equal(duplicateJoin.ok, false);
     assert.match(duplicateJoin.error, /already/i);
@@ -255,10 +325,13 @@ test('global group chat uses temporary unique usernames and short-lived history'
     const secondJoin = await emitAck(second, 'join-group', {
       username: 'Bob',
       captchaId: secondCaptcha.id,
-      captchaAnswer: solveCaptcha(secondCaptcha),
+      captchaIndex: 1,
+      captchaAnswer: solveCaptcha({ question: secondCaptcha.questions[1] }),
+      powSolution: solveProofOfWork(secondCaptcha),
     });
     assert.equal(secondJoin.ok, true);
     assert.equal(secondJoin.activeUsers, 2);
+    assert.deepEqual(secondJoin.users, ['Alice', 'Bob']);
 
     const groupStatus = await emitAck(first, 'group-status', {});
     assert.deepEqual(groupStatus, { ok: true, activeUsers: 2, isActive: true });
@@ -275,6 +348,7 @@ test('global group chat uses temporary unique usernames and short-lived history'
       username: 'Alice',
       captchaId: thirdCaptcha.id,
       captchaAnswer: solveCaptcha(thirdCaptcha),
+      powSolution: solveProofOfWork(thirdCaptcha),
     });
     assert.equal(thirdJoin.ok, true);
     assert.equal(thirdJoin.username, 'Alice');

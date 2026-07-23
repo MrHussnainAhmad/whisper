@@ -12,11 +12,16 @@ require('dotenv').config();
 const http = require('http');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
-const { app, ALLOWED_ORIGINS } = require('./app');
+const { app, ALLOWED_ORIGINS, ORIGIN_POLICY } = require('./app');
 const { registerHandlers } = require('./handlers');
 const { requireSecureSocket, ENFORCE_HTTPS } = require('./security');
 const { addSession, removeSession, setExpireHandler } = require('./sessions');
 const { acquireConnection, refreshConnections, releaseConnection } = require('./abuseLimiter');
+const {
+  startSecurityMonitoring,
+  stopSecurityMonitoring,
+  recordSecurityEvent,
+} = require('./securityMonitor');
 const {
   leaveQueue,
   getRoomBySessionId,
@@ -46,8 +51,11 @@ server.maxRequestsPerSocket = 100;
 // --- Socket.IO Setup ---
 const io = new Server(server, {
   cors: {
-    origin: ALLOWED_ORIGINS, // CORS_ORIGIN; * allowed for mobile clients
+    origin: ALLOWED_ORIGINS,
     methods: ['GET', 'POST'],
+  },
+  allowRequest: (req, callback) => {
+    callback(null, ORIGIN_POLICY.allows(req.headers.origin));
   },
   maxHttpBufferSize: 6 * 1024 * 1024,
   pingTimeout: 30000,
@@ -99,6 +107,7 @@ io.use(async (socket, next) => {
     if (!(await acquireConnection(socket))) return next(new Error('Too many connections'));
     return next();
   } catch (err) {
+    recordSecurityEvent('connection-admission-error');
     console.error('Connection admission failed:', err?.message || err);
     return next(new Error('Connection rejected'));
   }
@@ -169,6 +178,7 @@ async function start() {
     startKeepAlive();
     console.log('✓ Keep-alive scheduler started');
   }
+  startSecurityMonitoring();
 
   server.listen(PORT, () => {
     console.log(`Anonymous Chat Backend running on port ${PORT}`);
@@ -198,6 +208,7 @@ async function shutdown(signal) {
   const forceExitTimer = setTimeout(() => process.exit(1), 5000);
   clearInterval(connectionLeaseTimer);
   stopKeepAlive();
+  stopSecurityMonitoring();
   io.close();
   await closeRedisConnections();
   server.close(() => {

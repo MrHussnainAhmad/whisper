@@ -3,7 +3,7 @@
  *
  * ANONYMITY GUARANTEE:
  * - 1-to-1 messages are relayed in real-time and never stored.
- * - Group messages are kept in process memory for at most 90 seconds.
+ * - Group messages are relayed live and never retained by the backend.
  * - Images are forwarded as base64 payloads and never written to disk.
  * - If the receiver is offline, the message is silently dropped.
  * - No message logs, no analytics, no telemetry.
@@ -27,14 +27,16 @@ const {
 } = require('./matchmaking');
 const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite } = require('./invites');
 const { isValidInviteLocator } = require('./inviteRateLimiter');
-const { isValidPublicKey, isValidBase64 } = require('./validation');
+const { isValidMessageId, isValidPublicKey, isValidBase64 } = require('./validation');
 const { allowAction } = require('./abuseLimiter');
+const { recordSecurityEvent } = require('./securityMonitor');
 const {
   createCaptcha,
   consumeCaptcha,
   joinGroup,
   leaveGroup,
   getActiveCount,
+  getCurrentUsers,
   getGroupStatus,
   setGroupStatusListener,
   addMessage,
@@ -64,6 +66,7 @@ function registerHandlers(io, socket) {
       Promise.resolve()
         .then(() => handler(...args))
         .catch((err) => {
+          recordSecurityEvent('socket-handler-error');
           console.error(`Socket event ${event} failed:`, err?.message || err);
           if (event !== 'disconnect' && socket.connected) {
             socket.emit('error', { message: 'Request failed' });
@@ -88,6 +91,7 @@ function registerHandlers(io, socket) {
     socket.data.groupUsername = null;
     io.to('global-group').emit('group-presence', {
       activeUsers: getActiveCount(),
+      users: getCurrentUsers(),
       left: participant.username,
     });
     io.emit('group-status', getGroupStatus());
@@ -95,21 +99,26 @@ function registerHandlers(io, socket) {
   /**
    * FIND RANDOM - Enter the matchmaking queue.
    */
-  on('find-random', async () => {
+  on('find-random', async (data, ack) => {
+    if (typeof data === 'function') ack = data;
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const sessionId = socket.sessionId;
     const session = sessionId ? await getSession(sessionId) : null;
     if (!sessionId || !session) {
       socket.emit('error', { message: 'Session not found' });
+      reply({ ok: false, error: 'Session not found' });
       return;
     }
 
     if (session.roomId) {
       socket.emit('error', { message: 'You are already in a chat' });
+      reply({ ok: false, error: 'You are already in a chat' });
       return;
     }
 
     if (!(await allowAction(socket, 'matchmaking', { limit: 10, sourceLimit: 20 }))) {
       socket.emit('error', { message: 'Too many requests. Please wait.' });
+      reply({ ok: false, error: 'Too many requests. Please wait.' });
       return;
     }
     leaveGroupIfNeeded();
@@ -125,8 +134,10 @@ function registerHandlers(io, socket) {
       const { roomId, user1, user2 } = match;
       io.to(user1.socketId).emit('matched', { roomId });
       io.to(user2.socketId).emit('matched', { roomId });
+      reply({ ok: true, status: 'matched', roomId });
     } else {
       socket.emit('waiting', { message: 'Looking for someone online...' });
+      reply({ ok: true, status: 'waiting' });
     }
   });
 
@@ -226,7 +237,12 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Too many join attempts. Please wait.' });
       return;
     }
-    if (!consumeCaptcha(data?.captchaId, String(data?.captchaAnswer ?? ''))) {
+    if (!consumeCaptcha(
+      data?.captchaId,
+      String(data?.captchaAnswer ?? ''),
+      data?.captchaIndex,
+      data?.powSolution
+    )) {
       reply({ ok: false, error: 'Captcha answer is incorrect or expired.' });
       return;
     }
@@ -247,11 +263,13 @@ function registerHandlers(io, socket) {
       ok: true,
       username: result.username,
       activeUsers: result.activeUsers,
+      users: getCurrentUsers(),
       messages: result.messages,
       messageTtlMs: MESSAGE_TTL_MS,
     });
     socket.to('global-group').emit('group-presence', {
       activeUsers: getActiveCount(),
+      users: getCurrentUsers(),
       joined: result.username,
     });
     io.emit('group-status', getGroupStatus());
@@ -378,6 +396,7 @@ function registerHandlers(io, socket) {
 
     const { publicKey } = data || {};
     if (!isValidPublicKey(publicKey)) {
+      recordSecurityEvent('invalid-public-key');
       socket.emit('error', { message: 'Invalid key exchange payload.' });
       return;
     }
@@ -421,6 +440,7 @@ function registerHandlers(io, socket) {
     const proof = data?.proof;
     if (!sessionId || !socket.data.publicKey) return;
     if (!isValidBase64(proof, MAX_KEY_CONFIRM_BASE64_CHARS)) {
+      recordSecurityEvent('invalid-key-confirmation');
       socket.emit('error', { message: 'Invalid key confirmation payload.' });
       return;
     }
@@ -442,38 +462,60 @@ function registerHandlers(io, socket) {
   /**
    * SEND ENCRYPTED - Relay an E2E encrypted message to the peer.
    */
-  on('send-encrypted', async (data) => {
+  on('send-encrypted', async (data, ack) => {
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const sessionId = socket.sessionId;
     if (!sessionId) {
       socket.emit('error', { message: 'Session not found' });
+      reply({ ok: false, error: 'Session not found' });
       return;
     }
 
     if (!socket.chatVerified) {
       socket.emit('error', { message: 'Verify chat security before sending.' });
+      reply({ ok: false, error: 'Verify chat security before sending.' });
       return;
     }
 
     const roomData = await getRoomBySessionId(sessionId);
     if (!roomData) {
       socket.emit('error', { message: 'Not in a chat' });
+      reply({ ok: false, error: 'Not in a chat' });
       return;
     }
 
-    if (!(await allowAction(socket, 'message-count', { limit: 30, sourceLimit: 60 }))) {
-      socket.emit('error', { message: 'Too many messages. Please slow down.' });
+    const { encrypted, messageId } = data || {};
+    if (!isValidMessageId(messageId)) {
+      recordSecurityEvent('invalid-message-id');
+      socket.emit('error', { message: 'Invalid message identifier.' });
+      reply({ ok: false, error: 'Invalid message identifier.' });
       return;
     }
-
-    const { encrypted } = data || {};
     if (!isValidBase64(encrypted, MAX_ENCRYPTED_BASE64_CHARS)) {
+      recordSecurityEvent('invalid-encrypted-payload');
       socket.emit('error', { message: 'Invalid encrypted payload.' });
+      reply({ ok: false, error: 'Invalid encrypted payload.' });
       return;
     }
 
     const encryptedBytes = estimateBase64Bytes(encrypted);
     if (encryptedBytes > MAX_ENCRYPTED_BYTES) {
+      recordSecurityEvent('oversized-encrypted-payload');
       socket.emit('error', { message: 'Payload too large.' });
+      reply({ ok: false, error: 'Payload too large.' });
+      return;
+    }
+
+    const recentMessageIds = socket.data.recentMessageIds || new Set();
+    socket.data.recentMessageIds = recentMessageIds;
+    if (recentMessageIds.has(messageId)) {
+      reply({ ok: true, messageId, duplicate: true });
+      return;
+    }
+
+    if (!(await allowAction(socket, 'message-count', { limit: 30, sourceLimit: 60 }))) {
+      socket.emit('error', { message: 'Too many messages. Please slow down.' });
+      reply({ ok: false, error: 'Too many messages. Please slow down.' });
       return;
     }
 
@@ -483,16 +525,23 @@ function registerHandlers(io, socket) {
       cost: Math.max(1, encryptedBytes),
     }))) {
       socket.emit('error', { message: 'Bandwidth limit reached. Please wait.' });
+      reply({ ok: false, error: 'Bandwidth limit reached. Please wait.' });
       return;
     }
 
     const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) {
       socket.emit('error', { message: 'Peer is unavailable' });
+      reply({ ok: false, error: 'Peer is unavailable' });
       return;
     }
 
-    io.to(peerSocketId).emit('receive-encrypted', { encrypted });
+    recentMessageIds.add(messageId);
+    if (recentMessageIds.size > 200) {
+      recentMessageIds.delete(recentMessageIds.values().next().value);
+    }
+    io.to(peerSocketId).emit('receive-encrypted', { encrypted, messageId });
+    reply({ ok: true, messageId, duplicate: false });
   });
 
   /** Ephemeral typing metadata. It is validated, rate-limited, and never stored. */
