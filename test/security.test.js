@@ -159,12 +159,30 @@ test('spoofed forwarded protocol is ignored when no proxy is trusted', () => {
   delete require.cache[require.resolve('../security')];
 });
 
-test('production browser origins must use an explicit allow-list', () => {
-  assert.throws(() => createOriginPolicy('*', 'production'), /explicit/i);
+test('production rejects wildcard and invalid browser origins', () => {
+  assert.throws(() => createOriginPolicy('*', 'production'), /forbidden/i);
+  assert.throws(() => createOriginPolicy('null', 'production'), /forbidden/i);
+  assert.throws(() => createOriginPolicy('http://example.com', 'production'), /HTTPS/i);
+  assert.throws(() => createOriginPolicy('https://example.com/path', 'production'), /origins only/i);
+  assert.throws(() => createOriginPolicy('https://example.com,', 'production'), /empty entry/i);
+});
+
+test('empty production origin list allows native clients and denies browser clients', () => {
+  const policy = createOriginPolicy('', 'production');
+  assert.equal(policy.browserAccessEnabled, false);
+  assert.equal(policy.allowsRequestOrigin(undefined), true);
+  assert.equal(policy.allowsRequestOrigin(''), false);
+  assert.equal(policy.allowsRequestOrigin('null'), false);
+  assert.equal(policy.allowsRequestOrigin('https://example.com'), false);
+});
+
+test('production browser origins use an exact HTTPS allow-list', () => {
   const policy = createOriginPolicy('https://whisperchatapp.duckdns.org', 'production');
-  assert.equal(policy.allows(undefined), true);
-  assert.equal(policy.allows('https://whisperchatapp.duckdns.org'), true);
-  assert.equal(policy.allows('https://evil.example'), false);
+  assert.equal(policy.browserAccessEnabled, true);
+  assert.equal(policy.allowsRequestOrigin(undefined), true);
+  assert.equal(policy.allowsRequestOrigin('https://whisperchatapp.duckdns.org'), true);
+  assert.equal(policy.allowsRequestOrigin('https://evil.example'), false);
+  assert.equal(policy.allowsRequestOrigin('https://whisperchatapp.duckdns.org.evil.example'), false);
 });
 
 test('self-redemption does not destroy an invite and control fields are allow-listed', async () => {

@@ -12,7 +12,7 @@ require('dotenv').config();
 const http = require('http');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
-const { app, ALLOWED_ORIGINS, ORIGIN_POLICY } = require('./app');
+const { app, CORS_ORIGIN, ORIGIN_POLICY } = require('./app');
 const { registerHandlers } = require('./handlers');
 const { requireSecureSocket, ENFORCE_HTTPS } = require('./security');
 const { addSession, removeSession, setExpireHandler } = require('./sessions');
@@ -51,11 +51,13 @@ server.maxRequestsPerSocket = 100;
 // --- Socket.IO Setup ---
 const io = new Server(server, {
   cors: {
-    origin: ALLOWED_ORIGINS,
+    origin: CORS_ORIGIN,
     methods: ['GET', 'POST'],
+    credentials: false,
+    maxAge: 600,
   },
   allowRequest: (req, callback) => {
-    callback(null, ORIGIN_POLICY.allows(req.headers.origin));
+    callback(null, ORIGIN_POLICY.allowsRequestOrigin(req.headers.origin));
   },
   maxHttpBufferSize: 6 * 1024 * 1024,
   pingTimeout: 30000,
