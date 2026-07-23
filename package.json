@@ -10,7 +10,7 @@
     "audit:runtime": "npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {
-    "@socket.io/redis-adapter": "8.2.1",
+    "@socket.io/redis-adapter": "8.3.0",
     "cors": "2.8.5",
     "dotenv": "^17.4.2",
     "express": "5.2.1",
