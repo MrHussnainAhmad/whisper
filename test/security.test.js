@@ -37,6 +37,24 @@ async function connectClient() {
   return socket;
 }
 
+function emitAck(socket, event, data, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${event} timed out`)), timeoutMs);
+    const ack = (response) => {
+      clearTimeout(timer);
+      resolve(response);
+    };
+    if (data === undefined) socket.emit(event, ack);
+    else socket.emit(event, data, ack);
+  });
+}
+
+function solveCaptcha(captcha) {
+  const match = String(captcha?.question || '').match(/^(\d+) \+ (\d+)$/);
+  if (!match) throw new Error('Unexpected captcha format');
+  return String(Number(match[1]) + Number(match[2]));
+}
+
 before(async () => {
   const port = await getFreePort();
   serverUrl = `http://127.0.0.1:${port}`;
@@ -197,5 +215,67 @@ test('room routing never falls back to a stale socket ID', async () => {
     await destroyRoom(roomId);
     await removeSession(firstId);
     await removeSession(secondId);
+  }
+});
+
+test('global group chat uses temporary unique usernames and short-lived history', async () => {
+  const first = await connectClient();
+  const second = await connectClient();
+  const third = await connectClient();
+  try {
+    const firstCaptcha = (await emitAck(first, 'group-captcha')).captcha;
+    const firstJoin = await emitAck(first, 'join-group', {
+      username: 'Alice',
+      captchaId: firstCaptcha.id,
+      captchaAnswer: solveCaptcha(firstCaptcha),
+    });
+    assert.equal(firstJoin.ok, true);
+    assert.equal(firstJoin.username, 'Alice');
+    assert.equal(firstJoin.messageTtlMs, 90_000);
+
+    const duplicateCaptcha = (await emitAck(second, 'group-captcha')).captcha;
+    const duplicateJoin = await emitAck(second, 'join-group', {
+      username: 'alice',
+      captchaId: duplicateCaptcha.id,
+      captchaAnswer: solveCaptcha(duplicateCaptcha),
+    });
+    assert.equal(duplicateJoin.ok, false);
+    assert.match(duplicateJoin.error, /already/i);
+
+    const secondCaptcha = (await emitAck(second, 'group-captcha')).captcha;
+    const secondJoin = await emitAck(second, 'join-group', {
+      username: 'Bob',
+      captchaId: secondCaptcha.id,
+      captchaAnswer: solveCaptcha(secondCaptcha),
+    });
+    assert.equal(secondJoin.ok, true);
+    assert.equal(secondJoin.activeUsers, 2);
+
+    const groupStatus = await emitAck(first, 'group-status', {});
+    assert.deepEqual(groupStatus, { ok: true, activeUsers: 2, isActive: true });
+
+    const sent = await emitAck(first, 'group-message', { text: 'hello @Bob' });
+    assert.equal(sent.ok, true);
+    assert.equal(sent.message.username, 'Alice');
+    assert.deepEqual(sent.message.mentions, ['Bob']);
+    assert.equal(sent.message.private, true);
+
+    await emitAck(first, 'leave-group');
+    const thirdCaptcha = (await emitAck(third, 'group-captcha')).captcha;
+    const thirdJoin = await emitAck(third, 'join-group', {
+      username: 'Alice',
+      captchaId: thirdCaptcha.id,
+      captchaAnswer: solveCaptcha(thirdCaptcha),
+    });
+    assert.equal(thirdJoin.ok, true);
+    assert.equal(thirdJoin.username, 'Alice');
+    assert.equal(thirdJoin.messages.some((message) => message.text === 'hello @Bob'), false);
+  } finally {
+    first.emit('leave-group');
+    second.emit('leave-group');
+    third.emit('leave-group');
+    first.disconnect();
+    second.disconnect();
+    third.disconnect();
   }
 });

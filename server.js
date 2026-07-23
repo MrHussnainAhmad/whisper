@@ -100,6 +100,8 @@ io.use(async (socket, next) => {
  * On each new WebSocket connection, register all event handlers.
  */
 io.on('connection', async (socket) => {
+  console.log('Device connected');
+
   let released = false;
   socket.on('disconnect', () => {
     if (released) return;

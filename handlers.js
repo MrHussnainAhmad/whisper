@@ -2,7 +2,8 @@
  * handlers.js - Socket.IO Event Handlers
  *
  * ANONYMITY GUARANTEE:
- * - Messages are relayed in real-time and never stored.
+ * - 1-to-1 messages are relayed in real-time and never stored.
+ * - Group messages are kept in process memory for at most 90 seconds.
  * - Images are forwarded as base64 payloads and never written to disk.
  * - If the receiver is offline, the message is silently dropped.
  * - No message logs, no analytics, no telemetry.
@@ -27,6 +28,17 @@ const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite } = requ
 const { isValidInviteLocator } = require('./inviteRateLimiter');
 const { isValidPublicKey, isValidBase64 } = require('./validation');
 const { allowAction } = require('./abuseLimiter');
+const {
+  createCaptcha,
+  consumeCaptcha,
+  joinGroup,
+  leaveGroup,
+  getActiveCount,
+  getGroupStatus,
+  setGroupStatusListener,
+  addMessage,
+  MESSAGE_TTL_MS,
+} = require('./groupChat');
 
 // Max encrypted payload bytes (server cannot inspect message type due to E2E).
 const MAX_ENCRYPTED_BYTES = 4 * 1024 * 1024;
@@ -43,6 +55,8 @@ function estimateBase64Bytes(b64) {
  * Register all event handlers for a new socket connection.
  */
 function registerHandlers(io, socket) {
+  setGroupStatusListener((status) => io.emit('group-status', status));
+
   const on = (event, handler) => {
     socket.on(event, (...args) => {
       Promise.resolve()
@@ -61,6 +75,18 @@ function registerHandlers(io, socket) {
     socket.chatVerified = false;
     socket.data.publicKey = null;
     if (socket.sessionId) await clearSessionPublicKey(socket.sessionId);
+  };
+  const leaveGroupIfNeeded = () => {
+    if (!socket.sessionId) return;
+    const participant = leaveGroup(socket.sessionId);
+    if (!participant) return;
+    socket.leave('global-group');
+    socket.data.groupUsername = null;
+    io.to('global-group').emit('group-presence', {
+      activeUsers: getActiveCount(),
+      left: participant.username,
+    });
+    io.emit('group-status', getGroupStatus());
   };
   /**
    * FIND RANDOM - Enter the matchmaking queue.
@@ -82,6 +108,7 @@ function registerHandlers(io, socket) {
       socket.emit('error', { message: 'Too many requests. Please wait.' });
       return;
     }
+    leaveGroupIfNeeded();
     await resetChatState();
 
     if (await hasInvite(sessionId)) {
@@ -142,6 +169,7 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Too many invites. Please wait.' });
       return;
     }
+    leaveGroupIfNeeded();
     await resetChatState();
 
     if (await hasInvite(sessionId)) {
@@ -154,6 +182,103 @@ function registerHandlers(io, socket) {
 
   on('cancel-invite', async () => {
     if (socket.sessionId) await cancelInvite(socket.sessionId);
+  });
+
+  on('group-captcha', async (data, ack) => {
+    if (typeof data === 'function') ack = data;
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    if (!(await allowAction(socket, 'group-captcha', { limit: 8, sourceLimit: 20 }))) {
+      reply({ ok: false, error: 'Too many attempts. Please wait.' });
+      return;
+    }
+    reply({ ok: true, captcha: createCaptcha() });
+  });
+
+  on('group-status', async (data, ack) => {
+    if (typeof data === 'function') ack = data;
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    if (!(await allowAction(socket, 'group-status', { limit: 30, sourceLimit: 120, globalLimit: 20_000 }))) {
+      reply({ ok: false, error: 'Too many status requests. Please wait.' });
+      return;
+    }
+    reply({ ok: true, ...getGroupStatus() });
+  });
+
+  on('join-group', async (data, ack) => {
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    const sessionId = socket.sessionId;
+    const session = sessionId ? await getSession(sessionId) : null;
+    if (!sessionId || !session) {
+      reply({ ok: false, error: 'Session not found' });
+      return;
+    }
+    if (session.roomId || await isInQueue(sessionId)) {
+      reply({ ok: false, error: 'Leave your current chat/search first.' });
+      return;
+    }
+    if (!(await allowAction(socket, 'group-join', {
+      limit: 5, sourceLimit: 10, globalLimit: 1000, windowMs: 60_000,
+    }))) {
+      reply({ ok: false, error: 'Too many join attempts. Please wait.' });
+      return;
+    }
+    if (!consumeCaptcha(data?.captchaId, String(data?.captchaAnswer ?? ''))) {
+      reply({ ok: false, error: 'Captcha answer is incorrect or expired.' });
+      return;
+    }
+
+    await resetChatState();
+    if (await hasInvite(sessionId)) await cancelInvite(sessionId);
+    await leaveQueue(sessionId);
+
+    const result = joinGroup(sessionId, socket.id, data?.username);
+    if (!result.ok) {
+      reply({ ok: false, error: result.error });
+      return;
+    }
+
+    socket.data.groupUsername = result.username;
+    socket.join('global-group');
+    reply({
+      ok: true,
+      username: result.username,
+      activeUsers: result.activeUsers,
+      messages: result.messages,
+      messageTtlMs: MESSAGE_TTL_MS,
+    });
+    socket.to('global-group').emit('group-presence', {
+      activeUsers: getActiveCount(),
+      joined: result.username,
+    });
+    io.emit('group-status', getGroupStatus());
+  });
+
+  on('group-message', async (data, ack) => {
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    if (!(await allowAction(socket, 'group-message-count', {
+      limit: 20, sourceLimit: 40, globalLimit: 4000,
+    }))) {
+      reply({ ok: false, error: 'Too many messages. Please slow down.' });
+      return;
+    }
+    const result = addMessage(socket.sessionId, data?.text);
+    if (!result.ok) {
+      reply({ ok: false, error: result.error });
+      return;
+    }
+    if (result.targetSocketIds?.length) {
+      for (const socketId of result.targetSocketIds) {
+        io.to(socketId).emit('group-message', result.message);
+      }
+    } else {
+      io.to('global-group').emit('group-message', result.message);
+    }
+    reply({ ok: true, message: result.message });
+  });
+
+  on('leave-group', async (ack) => {
+    leaveGroupIfNeeded();
+    if (typeof ack === 'function') ack({ ok: true });
   });
 
   /**
@@ -211,6 +336,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
+    leaveGroupIfNeeded();
     await resetChatState();
 
     await leaveQueue(invite.sessionId);
@@ -376,7 +502,7 @@ function registerHandlers(io, socket) {
     io.to(peerSocketId).emit('peer-security-alert', { type, source: 'peer-claim' });
   });
 
-  on('verify-chat', async (ack) => {
+  const handleChannelReady = async (ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const sessionId = socket.sessionId;
     const roomData = sessionId ? await getRoomBySessionId(sessionId) : null;
@@ -384,7 +510,7 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Not in a chat' });
       return;
     }
-    if (!(await allowAction(socket, 'verify-chat', { limit: 2, sourceLimit: 6 }))) {
+    if (!(await allowAction(socket, 'secure-channel-ready', { limit: 2, sourceLimit: 6 }))) {
       reply({ ok: false, error: 'Rate limited' });
       return;
     }
@@ -405,7 +531,12 @@ function registerHandlers(io, socket) {
 
     socket.chatVerified = true;
     reply({ ok: true });
-  });
+  };
+
+  on('secure-channel-ready', handleChannelReady);
+  // Backward-compatible alias for older clients. This is transport readiness,
+  // not proof that both humans compared safety codes.
+  on('verify-chat', handleChannelReady);
 
   /**
    * CHAT READY - Signal that the user has entered the Chat Screen.
@@ -457,6 +588,7 @@ function registerHandlers(io, socket) {
    * LEAVE ROOM - Voluntarily end the chat.
    */
   on('leave-room', async () => {
+    leaveGroupIfNeeded();
     await handleDisconnectFromRoom(io, socket);
   });
 
@@ -469,6 +601,7 @@ function registerHandlers(io, socket) {
 
     await leaveQueue(sessionId);
     await cancelInvite(sessionId);
+    leaveGroupIfNeeded();
     await handleDisconnectFromRoom(io, socket);
     await removeSession(sessionId);
   });
