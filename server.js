@@ -173,7 +173,7 @@ async function start() {
   server.listen(PORT, () => {
     console.log(`Anonymous Chat Backend running on port ${PORT}`);
     console.log(REDIS_URL
-      ? 'Privacy mode: Redis persistence is verified in production.'
+      ? 'Privacy mode: messages are never stored; Valkey application state is TTL-bound.'
       : 'Privacy mode: ephemeral process memory only (dev).');
     if (ENFORCE_HTTPS) {
       console.log('HTTPS enforcement: ON');

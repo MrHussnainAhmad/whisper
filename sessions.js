@@ -32,12 +32,14 @@ const KEYS = {
 async function addSession(sessionId, socketId) {
   const createdAt = Date.now();
   if (!USE_REDIS) {
-    sessions.set(sessionId, { socketId, roomId: null, publicKey: null, createdAt });
+    sessions.set(sessionId, {
+      socketId, roomId: null, publicKey: null, keyConfirmed: false, createdAt,
+    });
     return;
   }
 
   const client = await getRedisClient();
-  const data = { socketId, roomId: null, publicKey: null, createdAt };
+  const data = { socketId, roomId: null, publicKey: null, keyConfirmed: false, createdAt };
   const multi = client.multi();
   multi.set(KEYS.session(sessionId), JSON.stringify(data), { PX: REDIS_KEY_TTL_MS });
   multi.set(KEYS.sessionBySocket(socketId), sessionId, { PX: REDIS_KEY_TTL_MS });
@@ -122,34 +124,80 @@ async function clearSessionRoom(sessionId) {
 async function setSessionPublicKey(sessionId, publicKey) {
   if (!USE_REDIS) {
     const session = sessions.get(sessionId);
-    if (session) session.publicKey = publicKey;
+    if (session) {
+      session.publicKey = publicKey;
+      session.keyConfirmed = false;
+    }
     return;
   }
 
   const client = await getRedisClient();
-  const raw = await client.get(KEYS.session(sessionId));
-  if (!raw) return;
-  const data = parseEphemeralJson(raw);
-  if (!data) return;
-  data.publicKey = publicKey;
-  await client.set(KEYS.session(sessionId), JSON.stringify(data), { PX: REDIS_KEY_TTL_MS });
+  await client.eval(
+    `local raw = redis.call('GET', KEYS[1])
+     if not raw then return 0 end
+     local ok, session = pcall(cjson.decode, raw)
+     if not ok then return 0 end
+     session.publicKey = ARGV[1]
+     session.keyConfirmed = false
+     redis.call('SET', KEYS[1], cjson.encode(session), 'PX', ARGV[2])
+     return 1`,
+    {
+      keys: [KEYS.session(sessionId)],
+      arguments: [publicKey, String(REDIS_KEY_TTL_MS)],
+    }
+  );
+}
+
+/** Record that this client sent a room-bound encrypted key proof. */
+async function setSessionKeyConfirmed(sessionId) {
+  if (!USE_REDIS) {
+    const session = sessions.get(sessionId);
+    if (session?.publicKey) session.keyConfirmed = true;
+    return;
+  }
+
+  const client = await getRedisClient();
+  await client.eval(
+    `local raw = redis.call('GET', KEYS[1])
+     if not raw then return 0 end
+     local ok, session = pcall(cjson.decode, raw)
+     if not ok or not session.publicKey or session.publicKey == cjson.null then return 0 end
+     session.keyConfirmed = true
+     redis.call('SET', KEYS[1], cjson.encode(session), 'PX', ARGV[1])
+     return 1`,
+    {
+      keys: [KEYS.session(sessionId)],
+      arguments: [String(REDIS_KEY_TTL_MS)],
+    }
+  );
 }
 
 /** Clear the session public key (new match / invite flow). */
 async function clearSessionPublicKey(sessionId) {
   if (!USE_REDIS) {
     const session = sessions.get(sessionId);
-    if (session) session.publicKey = null;
+    if (session) {
+      session.publicKey = null;
+      session.keyConfirmed = false;
+    }
     return;
   }
 
   const client = await getRedisClient();
-  const raw = await client.get(KEYS.session(sessionId));
-  if (!raw) return;
-  const data = parseEphemeralJson(raw);
-  if (!data) return;
-  data.publicKey = null;
-  await client.set(KEYS.session(sessionId), JSON.stringify(data), { PX: REDIS_KEY_TTL_MS });
+  await client.eval(
+    `local raw = redis.call('GET', KEYS[1])
+     if not raw then return 0 end
+     local ok, session = pcall(cjson.decode, raw)
+     if not ok then return 0 end
+     session.publicKey = cjson.null
+     session.keyConfirmed = false
+     redis.call('SET', KEYS[1], cjson.encode(session), 'PX', ARGV[1])
+     return 1`,
+    {
+      keys: [KEYS.session(sessionId)],
+      arguments: [String(REDIS_KEY_TTL_MS)],
+    }
+  );
 }
 
 /** Atomically claim two idle sessions for a room. */
@@ -293,6 +341,7 @@ module.exports = {
   setSessionRoom,
   clearSessionRoom,
   setSessionPublicKey,
+  setSessionKeyConfirmed,
   clearSessionPublicKey,
   claimSessionRooms,
   getSessionBySocketId,

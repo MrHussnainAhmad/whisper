@@ -204,8 +204,8 @@ async function getRoomBySessionId(sessionId) {
 /**
  * Get the peer's socket ID within a room.
  */
-async function getPeerSocketId(roomId, sessionId) {
-  const room = await getRoom(roomId);
+async function getPeerSocketId(roomId, sessionId, knownRoom = null) {
+  const room = knownRoom || await getRoom(roomId);
   if (!room) return null;
   let peerSessionId = null;
 

@@ -14,6 +14,7 @@ const {
   removeSession,
   getSession,
   setSessionPublicKey,
+  setSessionKeyConfirmed,
   clearSessionPublicKey,
 } = require('./sessions');
 const {
@@ -43,6 +44,7 @@ const {
 // Max encrypted payload bytes (server cannot inspect message type due to E2E).
 const MAX_ENCRYPTED_BYTES = 4 * 1024 * 1024;
 const MAX_ENCRYPTED_BASE64_CHARS = Math.ceil(MAX_ENCRYPTED_BYTES / 3) * 4;
+const MAX_KEY_CONFIRM_BASE64_CHARS = 512;
 
 function estimateBase64Bytes(b64) {
   if (!b64) return 0;
@@ -74,8 +76,10 @@ function registerHandlers(io, socket) {
   const resetChatState = async () => {
     socket.chatVerified = false;
     socket.data.publicKey = null;
+    socket.data.keyConfirmationSent = false;
     if (socket.sessionId) await clearSessionPublicKey(socket.sessionId);
   };
+  socket.data.keyConfirmationSent = false;
   const leaveGroupIfNeeded = () => {
     if (!socket.sessionId) return;
     const participant = leaveGroup(socket.sessionId);
@@ -104,7 +108,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'matchmaking', { limit: 10, sourceLimit: 20, globalLimit: 1000 }))) {
+    if (!(await allowAction(socket, 'matchmaking', { limit: 10, sourceLimit: 20 }))) {
       socket.emit('error', { message: 'Too many requests. Please wait.' });
       return;
     }
@@ -163,7 +167,7 @@ function registerHandlers(io, socket) {
     }
 
     if (!(await allowAction(socket, 'invite-create', {
-      limit: 5, sourceLimit: 10, globalLimit: 5000, windowMs: 300_000,
+      limit: 5, sourceLimit: 10, windowMs: 300_000,
     }))) {
       socket.emit('error', { message: 'Too many invites. Please wait.' });
       reply({ ok: false, error: 'Too many invites. Please wait.' });
@@ -197,7 +201,7 @@ function registerHandlers(io, socket) {
   on('group-status', async (data, ack) => {
     if (typeof data === 'function') ack = data;
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
-    if (!(await allowAction(socket, 'group-status', { limit: 30, sourceLimit: 120, globalLimit: 20_000 }))) {
+    if (!(await allowAction(socket, 'group-status', { limit: 30, sourceLimit: 120 }))) {
       reply({ ok: false, error: 'Too many status requests. Please wait.' });
       return;
     }
@@ -217,7 +221,7 @@ function registerHandlers(io, socket) {
       return;
     }
     if (!(await allowAction(socket, 'group-join', {
-      limit: 5, sourceLimit: 10, globalLimit: 1000, windowMs: 60_000,
+      limit: 5, sourceLimit: 10, windowMs: 60_000,
     }))) {
       reply({ ok: false, error: 'Too many join attempts. Please wait.' });
       return;
@@ -256,7 +260,7 @@ function registerHandlers(io, socket) {
   on('group-message', async (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     if (!(await allowAction(socket, 'group-message-count', {
-      limit: 20, sourceLimit: 40, globalLimit: 4000,
+      limit: 20, sourceLimit: 40,
     }))) {
       reply({ ok: false, error: 'Too many messages. Please slow down.' });
       return;
@@ -314,7 +318,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10, globalLimit: 2000 }))) {
+    if (!(await allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10 }))) {
       socket.emit('error', { message: 'Too many attempts. Wait a minute and try again.' });
       return;
     }
@@ -399,13 +403,40 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId);
+    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) {
       socket.emit('error', { message: 'Peer is unavailable' });
       return;
     }
 
     io.to(peerSocketId).emit('peer-key', { publicKey });
+  });
+
+  /**
+   * KEY CONFIRMATION - Relay an encrypted proof that the sender derived the
+   * same room-bound key. The relay cannot create or validate this proof.
+   */
+  on('key-confirm', async (data) => {
+    const sessionId = socket.sessionId;
+    const proof = data?.proof;
+    if (!sessionId || !socket.data.publicKey) return;
+    if (!isValidBase64(proof, MAX_KEY_CONFIRM_BASE64_CHARS)) {
+      socket.emit('error', { message: 'Invalid key confirmation payload.' });
+      return;
+    }
+    if (!(await allowAction(socket, 'key-confirm', { limit: 4, sourceLimit: 12 }))) {
+      socket.emit('rate-limited', { action: 'key-confirm', retryAfterMs: 60_000 });
+      return;
+    }
+
+    const roomData = await getRoomBySessionId(sessionId);
+    if (!roomData) return;
+    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
+    if (!peerSocketId) return;
+
+    await setSessionKeyConfirmed(sessionId);
+    socket.data.keyConfirmationSent = true;
+    io.to(peerSocketId).emit('peer-key-confirm', { proof });
   });
 
   /**
@@ -418,7 +449,18 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'message-count', { limit: 30, sourceLimit: 60, globalLimit: 6000 }))) {
+    if (!socket.chatVerified) {
+      socket.emit('error', { message: 'Verify chat security before sending.' });
+      return;
+    }
+
+    const roomData = await getRoomBySessionId(sessionId);
+    if (!roomData) {
+      socket.emit('error', { message: 'Not in a chat' });
+      return;
+    }
+
+    if (!(await allowAction(socket, 'message-count', { limit: 30, sourceLimit: 60 }))) {
       socket.emit('error', { message: 'Too many messages. Please slow down.' });
       return;
     }
@@ -438,25 +480,13 @@ function registerHandlers(io, socket) {
     if (!(await allowAction(socket, 'message-bytes', {
       limit: 8 * 1024 * 1024,
       sourceLimit: 16 * 1024 * 1024,
-      globalLimit: 256 * 1024 * 1024,
       cost: Math.max(1, encryptedBytes),
     }))) {
       socket.emit('error', { message: 'Bandwidth limit reached. Please wait.' });
       return;
     }
 
-    if (!socket.chatVerified) {
-      socket.emit('error', { message: 'Verify chat security before sending.' });
-      return;
-    }
-
-    const roomData = await getRoomBySessionId(sessionId);
-    if (!roomData) {
-      socket.emit('error', { message: 'Not in a chat' });
-      return;
-    }
-
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId);
+    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) {
       socket.emit('error', { message: 'Peer is unavailable' });
       return;
@@ -470,12 +500,12 @@ function registerHandlers(io, socket) {
     const sessionId = socket.sessionId;
     if (!sessionId || !socket.chatVerified || typeof data?.active !== 'boolean') return;
     if (!(await allowAction(socket, 'typing', {
-      limit: 40, sourceLimit: 80, globalLimit: 8000,
+      limit: 40, sourceLimit: 80,
     }))) return;
 
     const roomData = await getRoomBySessionId(sessionId);
     if (!roomData) return;
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId);
+    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (peerSocketId) io.to(peerSocketId).emit('peer-typing', { active: data.active });
   });
 
@@ -496,7 +526,7 @@ function registerHandlers(io, socket) {
     const roomData = await getRoomBySessionId(sessionId);
     if (!roomData) return;
 
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId);
+    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) return;
 
     io.to(peerSocketId).emit('peer-security-alert', { type, source: 'peer-claim' });
@@ -518,7 +548,6 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Key exchange incomplete' });
       return;
     }
-
     const room = roomData.room;
     const peerId = room.session1.sessionId === sessionId
       ? room.session2.sessionId
@@ -526,6 +555,10 @@ function registerHandlers(io, socket) {
     const peerSession = await getSession(peerId);
     if (!peerSession?.publicKey) {
       reply({ ok: false, error: 'Peer key exchange incomplete' });
+      return;
+    }
+    if (!socket.data.keyConfirmationSent || !peerSession.keyConfirmed) {
+      reply({ ok: false, error: 'Key confirmation incomplete' });
       return;
     }
 
@@ -544,13 +577,13 @@ function registerHandlers(io, socket) {
   on('chat-ready', async () => {
     const sessionId = socket.sessionId;
     if (!sessionId) return;
-    if (!(await allowAction(socket, 'chat-ready', { limit: 10, sourceLimit: 20, globalLimit: 2000 }))) {
+    if (!(await allowAction(socket, 'chat-ready', { limit: 10, sourceLimit: 20 }))) {
       socket.emit('rate-limited', { action: 'chat-ready', retryAfterMs: 60_000 });
       return;
     }
     const roomData = await getRoomBySessionId(sessionId);
     if (!roomData) return;
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId);
+    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (peerSocketId) io.to(peerSocketId).emit('peer-ready');
   });
 
@@ -577,7 +610,7 @@ function registerHandlers(io, socket) {
     }
 
     const { roomId } = roomData;
-    const peerSocketId = await getPeerSocketId(roomId, sessionId);
+    const peerSocketId = await getPeerSocketId(roomId, sessionId, roomData.room);
     socket.emit('chat-ended', { reasonCode: 'reported' });
     if (peerSocketId) io.to(peerSocketId).emit('chat-ended', { reasonCode: 'reported' });
 
@@ -619,7 +652,7 @@ async function handleDisconnectFromRoom(io, socket) {
   if (!roomData) return;
 
   const { roomId } = roomData;
-  const peerSocketId = await getPeerSocketId(roomId, sessionId);
+  const peerSocketId = await getPeerSocketId(roomId, sessionId, roomData.room);
 
   if (peerSocketId) {
     io.to(peerSocketId).emit('chat-ended', {

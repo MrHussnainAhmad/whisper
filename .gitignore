@@ -39,8 +39,11 @@ coverage/
 
 # Cache / temp
 .cache/
+.npm-cache/
+.codex-*/
 tmp/
 temp/
+*.tmp
 
 # OS/editor
 .DS_Store

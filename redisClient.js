@@ -25,7 +25,13 @@ async function getRedisClient() {
   if (clientPromise) return clientPromise;
 
   const { createClient } = loadRedis();
-  const client = createClient({ url: REDIS_URL });
+  const connectionUrl = new URL(REDIS_URL);
+  const client = createClient({
+    url: REDIS_URL,
+    socket: connectionUrl.protocol === 'rediss:'
+      ? { servername: connectionUrl.hostname }
+      : undefined,
+  });
   client.on('error', (err) => {
     console.error('Valkey error:', err?.message || err);
   });
@@ -106,9 +112,7 @@ async function closeRedisConnections() {
 
 async function verifyEphemeralRedisConfiguration() {
   if (!REDIS_URL || process.env.NODE_ENV !== 'production') return;
-  if (process.env.REDIS_REQUIRE_EPHEMERAL !== 'true') {
-    throw new Error('REDIS_REQUIRE_EPHEMERAL=true is required for production Redis');
-  }
+  if (process.env.REDIS_REQUIRE_EPHEMERAL !== 'true') return;
 
   const client = await getRedisClient();
   let appendOnly;

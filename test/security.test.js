@@ -66,6 +66,7 @@ before(async () => {
       PORT: String(port),
       TRUST_PROXY: '0',
       REDIS_URL: '',
+      VALKEY_URL: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -169,6 +170,14 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     const inviterSeesKey = once(inviter, 'peer-key');
     joiner.emit('key-exchange', { publicKey: Buffer.alloc(32, 3).toString('base64') });
     await inviterSeesKey;
+
+    const joinerSeesConfirmation = once(joiner, 'peer-key-confirm');
+    inviter.emit('key-confirm', { proof: 'AAAA' });
+    assert.deepEqual(await joinerSeesConfirmation, { proof: 'AAAA' });
+
+    const inviterSeesConfirmation = once(inviter, 'peer-key-confirm');
+    joiner.emit('key-confirm', { proof: 'BBBB' });
+    assert.deepEqual(await inviterSeesConfirmation, { proof: 'BBBB' });
 
     const verified = await new Promise((resolve) => inviter.emit('verify-chat', resolve));
     assert.deepEqual(verified, { ok: true });
