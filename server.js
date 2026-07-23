@@ -24,7 +24,15 @@ const {
   destroyRoom,
 } = require('./matchmaking');
 const { cancelInvite } = require('./invites');
-const { REDIS_URL, getRedisAdapterClients, verifyEphemeralRedisConfiguration } = require('./redisClient');
+const {
+  REDIS_URL,
+  getRedisClient,
+  getRedisAdapterClients,
+  startKeepAlive,
+  stopKeepAlive,
+  closeRedisConnections,
+  verifyEphemeralRedisConfiguration,
+} = require('./redisClient');
 
 const PORT = process.env.PORT || 3000;
 
@@ -145,6 +153,9 @@ async function start() {
 
   if (REDIS_URL) {
     await verifyEphemeralRedisConfiguration();
+    const client = await getRedisClient();
+    await client.ping();
+    console.log('✓ Valkey connected');
     let createAdapter;
     try {
       ({ createAdapter } = require('@socket.io/redis-adapter'));
@@ -154,7 +165,9 @@ async function start() {
     const clients = await getRedisAdapterClients();
     if (!clients) throw new Error('Redis adapter clients not available');
     io.adapter(createAdapter(clients.pubClient, clients.subClient));
-    console.log('Socket.IO Redis adapter enabled.');
+    console.log('✓ Socket.IO adapter connected');
+    startKeepAlive();
+    console.log('✓ Keep-alive scheduler started');
   }
 
   server.listen(PORT, () => {
@@ -176,13 +189,28 @@ start().catch((err) => {
 /**
  * Graceful shutdown
  */
-function shutdown(signal) {
+let shutdownStarted = false;
+
+async function shutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
   console.log(`Received ${signal}, shutting down...`);
-  io.close(() => {
-    server.close(() => process.exit(0));
+  const forceExitTimer = setTimeout(() => process.exit(1), 5000);
+  clearInterval(connectionLeaseTimer);
+  stopKeepAlive();
+  io.close();
+  await closeRedisConnections();
+  server.close(() => {
+    clearTimeout(forceExitTimer);
+    process.exit(0);
   });
-  setTimeout(() => process.exit(1), 5000).unref();
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => { shutdown('SIGINT').catch((err) => {
+  console.error('Shutdown failed:', err?.message || err);
+  process.exit(1);
+}); });
+process.on('SIGTERM', () => { shutdown('SIGTERM').catch((err) => {
+  console.error('Shutdown failed:', err?.message || err);
+  process.exit(1);
+}); });
