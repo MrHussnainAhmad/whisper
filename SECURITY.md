@@ -10,9 +10,10 @@ database URLs in a report.
 
 - Terminate TLS at the application or exactly `TRUST_PROXY` trusted hops away.
 - Set `CORS_ORIGIN` to explicit HTTPS origins; wildcard production origins are rejected.
-- Use an ephemeral Valkey database with TLS and persistence/backups disabled.
-- Production Redis startup requires `rediss:` and readable persistence settings
-  proving AOF and snapshots are disabled. Provider backups require separate review.
+- Keep temporary state in the backend process RAM. No external Redis/Valkey
+  service or adapter is used. Run one process/replica; restarts end active chats.
+- Configure host/container RAM limits and prevent swap, crash dumps, and memory
+  snapshots from persisting sensitive process memory.
 - The server binds to `127.0.0.1` by default. See `deployment/README.md` for the
   unfinished onion-service topology; do not expose a clearweb fallback.
 - Keep `.env`, signing material, service-account files, and build artifacts out of Git.

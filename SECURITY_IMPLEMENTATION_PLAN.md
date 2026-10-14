@@ -1,6 +1,7 @@
 # One-to-one privacy implementation plan and next-session handoff
 
 Prepared: 2026-10-14 (Asia/Karachi).
+Updated: 2026-10-15 (Asia/Karachi): external Redis/Valkey storage removed at the user's request.
 Status: implementation started; untested. The full privacy architecture is NOT implemented. See the implementation handoff below before continuing.
 
 ## 1. Scope and user requirements
@@ -26,7 +27,7 @@ These are source changes, not verified security guarantees. No tests, builds, ru
 
 Implemented locally:
 
-- Backend: bounded event concurrency, linear Base64 validation, payload budgets before expensive processing, volatile one-to-one forwarding, tighter room teardown, protocol-version checks, mandatory production Redis TLS/persistence checks, and loopback binding by default. Redis checks do not establish that a provider has disabled backups.
+- Backend: bounded event concurrency, linear Base64 validation, payload budgets before expensive processing, volatile one-to-one forwarding, tighter room teardown, protocol-version checks, and loopback binding by default. On October 15, removed Redis/Valkey clients, adapters, dependencies, production requirement, and remote storage branches. Sessions, invite locators, queues, rooms, and abuse counters now live only in this server process RAM. Room claims, invite consumption, and teardown do not yield; rate-limit bucket count is bounded.
 - Client: protocol v4 room binding, 256-bit invite secrets, bounded serialized sends, session-epoch guards against stale asynchronous work, encrypted typing/security/policy/close/liveness events, and cancellation of pending sends when the chat ends. Old invite codes and older chat clients are incompatible; client/server rollout must be coordinated.
 - Media: independent sender-controlled `Allow saving my media`, disabled by default. Permission is authenticated inside each attachment and applies to future attachments. Explicit exports use Android's document picker or an iOS share sheet; app-owned temporary exports and picker copies are cleaned up. Exported copies cannot be recalled. A modified recipient can ignore UI restrictions.
 - Capture: Android secure-window, overlay suppression, obscured-touch rejection, and audio-capture restrictions; an iOS native module covers inactive/captured windows, alongside Expo capture protection. Missing iOS native protection prevents chat entry. These changes require native builds and real-device verification; iOS arbitrary-UI screenshot prevention is NOT guaranteed.
@@ -44,7 +45,9 @@ Still required, in this order:
 4. After the user permits testing: native compile/autolinking, protocol and session-race tests, updated v4 fixtures, directional media permission checks, capture/overlay device matrix, cache/log/persistence inspection, Tor leak tests, dependency audit, and independent cryptographic/security review. Existing tests may still assume old invite sizes or protocol versions.
 5. Enable release connections only after the actual transport/protocol protections and acceptance gates are satisfied. No claims of protection against endpoint compromise, recipient copying, or global traffic correlation.
 
-Useful entry points: backend `handlers.js`, `matchmaking.js`, `redisClient.js`; mobile `src/services/socket.js`, `e2e.js`, `peerLiveness.js`, `captureProtection.js`, `mediaExport.js`, `src/screens/ChatScreen.js`, `plugins/withPrivacyWindow.js`, and `modules/whisper-privacy/ios/WhisperPrivacyModule.swift`.
+RAM-only deployment requirement: one Node process and one replica. No cluster mode or autoscaling across independent processes. Restarting ends chats and invalidates invites. Retire any previously provisioned external state service and remove deployment secrets separately; local source edits do not erase remote data or change the running deployment. Host RAM limits, swap, dumps, and snapshots require operational controls. No tests or builds were run for this change.
+
+Useful entry points: backend `handlers.js`, `matchmaking.js`, `sessions.js`, `invites.js`, `abuseLimiter.js`; mobile `src/services/socket.js`, `e2e.js`, `peerLiveness.js`, `captureProtection.js`, `mediaExport.js`, `src/screens/ChatScreen.js`, `plugins/withPrivacyWindow.js`, and `modules/whisper-privacy/ios/WhisperPrivacyModule.swift`.
 
 ## 2. Security boundaries and unresolved constraints
 
@@ -171,12 +174,12 @@ Proposed states: idle -> anonymous transport connecting -> peer authentication -
 
 ## 8. Backend and operations
 
-- No stored message history in process data structures or Redis. Small bounded transport buffering is unavoidable; it must not become an offline queue.
-- Redis/Valkey, if retained, holds only expiring routing, invite-locator, and abuse-control metadata. Verify persistence and backups disabled. Shared pub/sub may transiently carry ciphertext; restrict ACLs and encrypt connections.
-- Inspect proxy, load-balancer, hosting, Redis, OS, diagnostic, and crash logging. Avoid client IP/content/key records; prohibit core dumps and unintended persistent snapshots for sensitive processes where configurable. Do not claim infrastructure absence of logs from source inspection alone.
+- No stored message history in process data structures. Small bounded transport buffering is unavoidable; it must not become an offline queue.
+- Temporary routing, invite-locator, and abuse-control metadata stays in this server process RAM. No external state service, pub/sub, or persistence. Run one process/replica and use bounded admission and counters. Restarts erase temporary application state.
+- Inspect proxy, load-balancer, hosting, OS, diagnostic, and crash logging. Avoid client IP/content/key records; prohibit core dumps, swap, and unintended persistent memory snapshots for sensitive processes where configurable. Do not claim infrastructure absence of logs from source inspection alone.
 - With onion transport, existing per-IP limits may see only a local/Tor proxy address. Redesign admission using bounded anonymous connection/session budgets and cheap checks before expensive work, without trusting spoofable headers or introducing stable tracking IDs. Do not defeat IP privacy by forwarding original client addresses.
 - Patch reachable dependency issues, bound all frame/packet/attachment processing, replace problematic Base64 validation, constrain concurrency, and validate control payloads before allocation or expensive crypto.
-- Check trusted-proxy/TLS topology, private service exposure, Redis ACLs, connection limits, and multi-instance teardown races. `Origin` checks are not authentication.
+- Check trusted-proxy/TLS topology, private service exposure, connection limits, atomic RAM operations, and single-process deployment. `Origin` checks are not authentication.
 - Anonymous routing does not prevent floods. Measure resource limits and overload rejection; no unlimited padding, unlimited message queues, or unconstrained proof-of-work.
 - Harden releases: pinned/reviewed dependencies, signed builds and updates, minimal update/signing access, reproducible-build feasibility, and no secret-bearing build logs. Attestation is not a magic proof of honest clients and may introduce identifiers/external requests; evaluate separately before adoption.
 
@@ -194,7 +197,7 @@ Proposed states: idle -> anonymous transport connecting -> peer authentication -
 | Transport bridge | Likely native networking adapter/custom Expo development build; demonstrate remote/onion name resolution and no direct/DNS fallback |
 | Build tools | Android SDK/NDK as required; macOS + Xcode and signing access for iOS; Rust/native tools if selected dependency needs them. Availability not yet verified |
 | Test hardware | At least two physical phones, Android/iOS cross-platform pairs, multiple supported OS versions/vendors, stock and third-party recorders, mirroring, and controlled Wi-Fi packet capture |
-| Infrastructure | Isolated onion-service staging host, verified transport configuration and ephemeral Redis if required. No production provisioning performed |
+| Infrastructure | Isolated onion-service staging host, verified transport configuration, single-process RAM-only backend, host memory/swap/dump controls. No production provisioning performed |
 | Test harness | Hostile relay simulator, packet capture, network delay/loss injection, OS/device capture tests, storage inspection after restart/crash |
 | Independent review | Cryptographic integration, mobile privacy, networking/IP leak review; external reviewer/budget not arranged |
 
@@ -213,12 +216,12 @@ Paths are relative to this backend directory.
 - `../mobile/src/screens/HomeScreen.js`, `WaitingScreen.js`, `ChatEndedScreen.js`: invite UI, secure readiness, disconnect reason.
 - `../mobile/src/config.js`, `app.config.js`, `app.json`, `android/app/src/main/AndroidManifest.xml`, `android/app/src/main/java/com/hussnainahmadsahi/chat/MainActivity.kt`: native build/privacy/network configuration.
 - `handlers.js`, `matchmaking.js`, `sessions.js`, `invites.js`: ciphertext relay, routing, atomic close and invite use, protocol migration.
-- `server.js`, `security.js`, `networkConfig.js`, `abuseLimiter.js`, `httpLimiter.js`, `validation.js`, `redisClient.js`: transport, limits, persistence enforcement, deployment assumptions.
+- `server.js`, `security.js`, `networkConfig.js`, `abuseLimiter.js`, `httpLimiter.js`, `validation.js`: transport, RAM-only limits, deployment assumptions. `redisClient.js` and its parsing helper were removed.
 - `test/security.test.js`, `../mobile/test/e2e.test.cjs`: existing tests to extend/replace meaningfully for new protocol.
 
 Earlier local review in this conversation: 13 backend and 5 mobile tests passed. These are not proof of the target architecture. Audit found engine.io 6.6.9 and socket.io-parser 4.2.6 high-severity availability advisories, proxy-addr 2.0.7 critical advisory with deployment-dependent applicability, and qs 6.15.3 moderate advisories. Re-run audits and assess reachable paths; do not blindly force upgrades. A 5,592,408-character allowed-size Base64 input caused a RangeError in validation on the local Node runtime; validation occurs before message bandwidth checks. Handler catches the exception, but expensive work remains a concern.
 
-Local configuration review found production mode, Redis TLS, and optional persistence enforcement unset; this is not verification of the deployed infrastructure. Do not copy secrets into reports. The existing public server URL in mobile config is not the planned strict anonymity route.
+Historical local review found production mode and remote-store persistence safeguards unset. That storage integration has since been removed. This is not verification of the deployed infrastructure. Do not copy secrets into reports. Direct development networking is not the planned strict anonymity route.
 
 Both repositories have substantial pre-existing user changes. Backend dirty files included `.env.example`, `package-lock.json`, `package.json`, `server.js`; mobile has many modified/untracked files. Re-read git status before edits, preserve all user work, and do not reset, clean, or overwrite unrelated changes.
 

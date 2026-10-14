@@ -64,7 +64,7 @@ function registerHandlers(io, socket) {
   let pendingHandlers = 0;
   const on = (event, handler) => {
     socket.on(event, (...args) => {
-      // Never retain an unbounded queue of large packets behind Redis calls.
+      // Never retain an unbounded queue of large packets behind async handlers.
       if (event !== 'disconnect' && pendingHandlers >= 8) {
         recordSecurityEvent('socket-inflight-limit');
         socket.disconnect(true);

@@ -20,11 +20,19 @@ the actual trusted topology. No access logs or request-body captures for chat.
 TLS termination, OS/service logs, provider backups, crash dumps, and swap must
 be inspected before release; application code alone cannot enforce those settings.
 
-Production Redis must use `rediss://`, permit CONFIG GET, and report
-`appendonly=no` and `save=""`. The application now refuses startup otherwise.
-Provider backups/snapshots must separately be disabled. No message history or
-attachment storage is added. Redis routing and rate-limit metadata remains
-temporary. Connection buffers/pub-sub can transiently carry ciphertext.
+All sessions, invites, room routing, and rate limits stay in the Node process
+RAM. No Redis/Valkey client, adapter, or external-state connection remains.
+Run exactly one Node process and one deployment replica; do not enable PM2
+cluster mode, autoscaling, or multiple workers. Independent processes cannot
+match users or share limits. Restarting loses temporary state and ends chats.
+No message history or attachment storage is added. Transport buffers can
+transiently carry ciphertext.
+
+Remove obsolete REDIS_URL/VALKEY_URL secrets from the deployment environment.
+They are no longer used. Previously deployed services and any existing remote
+data must be retired separately; changing source does not delete provider data.
+Set host/container RAM limits and disable swap, core dumps, and memory snapshots
+for the sensitive process. Application RAM alone does not control host access.
 
 The existing source-IP admission logic needs redesign before Tor deployment:
 Tor connections converge on local/proxy addresses, and a per-source cap can

@@ -2,7 +2,7 @@
  * server.js - Anonymous Chat Backend
  *
  * One-to-one payloads are forwarded as ciphertext without message history.
- * Redis session metadata has a separate lifetime from this process.
+ * Session and routing metadata live only in this server process RAM.
  * Deployment logging, persistence, and network privacy require configuration;
  * see SECURITY_IMPLEMENTATION_PLAN.md for remaining work and limitations.
  */
@@ -16,7 +16,7 @@ const { app, CORS_ORIGIN, ORIGIN_POLICY } = require('./app');
 const { registerHandlers } = require('./handlers');
 const { requireSecureSocket, ENFORCE_HTTPS } = require('./security');
 const { addSession, removeSession, setExpireHandler } = require('./sessions');
-const { acquireConnection, refreshConnections, releaseConnection } = require('./abuseLimiter');
+const { acquireConnection, releaseConnection } = require('./abuseLimiter');
 const {
   startSecurityMonitoring,
   stopSecurityMonitoring,
@@ -29,15 +29,6 @@ const {
   destroyRoom,
 } = require('./matchmaking');
 const { cancelInvite } = require('./invites');
-const {
-  REDIS_URL,
-  getRedisClient,
-  getRedisAdapterClients,
-  startKeepAlive,
-  stopKeepAlive,
-  closeRedisConnections,
-  verifyEphemeralRedisConfiguration,
-} = require('./redisClient');
 
 const PORT = process.env.PORT || 3000;
 const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
@@ -148,46 +139,12 @@ io.on('connection', async (socket) => {
   }
 });
 
-let leaseRefreshRunning = false;
-const connectionLeaseTimer = setInterval(() => {
-  if (leaseRefreshRunning) return;
-  leaseRefreshRunning = true;
-  refreshConnections(io.sockets.sockets.values())
-    .catch((err) => console.error('Connection lease refresh failed:', err?.message || err))
-    .finally(() => { leaseRefreshRunning = false; });
-}, 30_000);
-connectionLeaseTimer.unref();
-
 async function start() {
-  if (process.env.NODE_ENV === 'production' && !REDIS_URL) {
-    throw new Error('REDIS_URL is required in production for atomic invites, shared sessions, and rate limits');
-  }
-
-  if (REDIS_URL) {
-    await verifyEphemeralRedisConfiguration();
-    const client = await getRedisClient();
-    await client.ping();
-    console.log('✓ Valkey connected');
-    let createAdapter;
-    try {
-      ({ createAdapter } = require('@socket.io/redis-adapter'));
-    } catch (err) {
-      throw new Error('Missing @socket.io/redis-adapter. Run `npm install` in backend.');
-    }
-    const clients = await getRedisAdapterClients();
-    if (!clients) throw new Error('Redis adapter clients not available');
-    io.adapter(createAdapter(clients.pubClient, clients.subClient));
-    console.log('✓ Socket.IO adapter connected');
-    startKeepAlive();
-    console.log('✓ Keep-alive scheduler started');
-  }
   startSecurityMonitoring();
 
   server.listen(PORT, BIND_HOST, () => {
     console.log(`Anonymous Chat Backend running on port ${PORT}`);
-    console.log(REDIS_URL
-      ? 'Privacy mode: messages are never stored; Valkey application state is TTL-bound.'
-      : 'Privacy mode: ephemeral process memory only (dev).');
+    console.log('Privacy mode: temporary state in this process RAM only; no external state service.');
     if (ENFORCE_HTTPS) {
       console.log('HTTPS enforcement: ON');
     }
@@ -209,11 +166,8 @@ async function shutdown(signal) {
   shutdownStarted = true;
   console.log(`Received ${signal}, shutting down...`);
   const forceExitTimer = setTimeout(() => process.exit(1), 5000);
-  clearInterval(connectionLeaseTimer);
-  stopKeepAlive();
   stopSecurityMonitoring();
   io.close();
-  await closeRedisConnections();
   server.close(() => {
     clearTimeout(forceExitTimer);
     process.exit(0);
