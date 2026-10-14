@@ -231,9 +231,9 @@ async function destroyRoom(roomId) {
   if (!room) return null;
 
   if (!USE_REDIS) {
-    await clearSessionRoom(room.session1.sessionId);
-    await clearSessionRoom(room.session2.sessionId);
     rooms.delete(roomId);
+    await clearSessionRoom(room.session1.sessionId, roomId);
+    await clearSessionRoom(room.session2.sessionId, roomId);
     return room;
   }
 
@@ -245,6 +245,8 @@ async function destroyRoom(roomId) {
          local ok, session = pcall(cjson.decode, raw)
          if ok and session.roomId == ARGV[1] then
            session.roomId = cjson.null
+           session.publicKey = cjson.null
+           session.keyConfirmed = false
            redis.call('SET', KEYS[i], cjson.encode(session), 'PX', ARGV[2])
          end
        end

@@ -61,25 +61,35 @@ function estimateBase64Bytes(b64) {
 function registerHandlers(io, socket) {
   setGroupStatusListener((status) => io.emit('group-status', status));
 
+  let pendingHandlers = 0;
   const on = (event, handler) => {
     socket.on(event, (...args) => {
+      // Never retain an unbounded queue of large packets behind Redis calls.
+      if (event !== 'disconnect' && pendingHandlers >= 8) {
+        recordSecurityEvent('socket-inflight-limit');
+        socket.disconnect(true);
+        return;
+      }
+      pendingHandlers += 1;
       Promise.resolve()
         .then(() => handler(...args))
         .catch((err) => {
           recordSecurityEvent('socket-handler-error');
-          console.error(`Socket event ${event} failed:`, err?.message || err);
+          console.error(`Socket event ${event} failed`);
           if (event !== 'disconnect' && socket.connected) {
             socket.emit('error', { message: 'Request failed' });
             const ack = args.at(-1);
             if (typeof ack === 'function') ack({ ok: false, error: 'Request failed' });
           }
-        });
+        })
+        .finally(() => { pendingHandlers -= 1; });
     });
   };
   const resetChatState = async () => {
     socket.chatVerified = false;
     socket.data.publicKey = null;
     socket.data.keyConfirmationSent = false;
+    socket.data.recentMessageIds = new Set();
     if (socket.sessionId) await clearSessionPublicKey(socket.sessionId);
   };
   socket.data.keyConfirmationSent = false;
@@ -307,7 +317,8 @@ function registerHandlers(io, socket) {
    * JOIN INVITE - Redeem an invite code and start a chat.
    */
   on('join-invite', async (data) => {
-    const locator = data?.locator?.toUpperCase().trim();
+    const locator = typeof data?.locator === 'string' && data.locator.length <= 64
+      ? data.locator.toUpperCase().trim() : null;
     const sessionId = socket.sessionId;
 
     const session = sessionId ? await getSession(sessionId) : null;
@@ -388,6 +399,10 @@ function registerHandlers(io, socket) {
    * KEY EXCHANGE - Relay public key to peer.
    */
   on('key-exchange', async (data) => {
+    if (data?.protocolVersion !== 4) {
+      socket.emit('error', { message: 'Update the app to establish this chat.' });
+      return;
+    }
     const sessionId = socket.sessionId;
     if (!sessionId) {
       socket.emit('error', { message: 'Session not found' });
@@ -428,7 +443,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    io.to(peerSocketId).emit('peer-key', { publicKey });
+    io.to(peerSocketId).emit('peer-key', { publicKey, protocolVersion: 4 });
   });
 
   /**
@@ -491,7 +506,8 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Invalid message identifier.' });
       return;
     }
-    if (!isValidBase64(encrypted, MAX_ENCRYPTED_BASE64_CHARS)) {
+    if (typeof encrypted !== 'string' || encrypted.length === 0 ||
+        encrypted.length > MAX_ENCRYPTED_BASE64_CHARS || encrypted.length % 4 !== 0) {
       recordSecurityEvent('invalid-encrypted-payload');
       socket.emit('error', { message: 'Invalid encrypted payload.' });
       reply({ ok: false, error: 'Invalid encrypted payload.' });
@@ -513,7 +529,8 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'message-count', { limit: 30, sourceLimit: 60 }))) {
+    // Includes encrypted receipts, typing, privacy policy and liveness traffic.
+    if (!(await allowAction(socket, 'message-count', { limit: 120, sourceLimit: 240 }))) {
       socket.emit('error', { message: 'Too many messages. Please slow down.' });
       reply({ ok: false, error: 'Too many messages. Please slow down.' });
       return;
@@ -529,6 +546,18 @@ function registerHandlers(io, socket) {
       return;
     }
 
+    // Charge malformed traffic too, before scanning the full payload.
+    if (!isValidBase64(encrypted, MAX_ENCRYPTED_BASE64_CHARS)) {
+      recordSecurityEvent('invalid-encrypted-payload');
+      reply({ ok: false, error: 'Invalid encrypted payload.' });
+      return;
+    }
+    const currentRoom = await getRoomBySessionId(sessionId);
+    if (!socket.connected || !socket.chatVerified ||
+        currentRoom?.roomId !== roomData.roomId) {
+      reply({ ok: false, error: 'Chat ended' });
+      return;
+    }
     const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) {
       socket.emit('error', { message: 'Peer is unavailable' });
@@ -540,46 +569,12 @@ function registerHandlers(io, socket) {
     if (recentMessageIds.size > 200) {
       recentMessageIds.delete(recentMessageIds.values().next().value);
     }
-    io.to(peerSocketId).emit('receive-encrypted', { encrypted, messageId });
+    io.to(peerSocketId).volatile.emit('receive-encrypted', { encrypted, messageId });
     reply({ ok: true, messageId, duplicate: false });
   });
 
-  /** Ephemeral typing metadata. It is validated, rate-limited, and never stored. */
-  on('typing', async (data) => {
-    const sessionId = socket.sessionId;
-    if (!sessionId || !socket.chatVerified || typeof data?.active !== 'boolean') return;
-    if (!(await allowAction(socket, 'typing', {
-      limit: 40, sourceLimit: 80,
-    }))) return;
-
-    const roomData = await getRoomBySessionId(sessionId);
-    if (!roomData) return;
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
-    if (peerSocketId) io.to(peerSocketId).emit('peer-typing', { active: data.active });
-  });
-
-  /**
-   * SECURITY ALERT - Notify peer of a capture attempt (screenshot/recording).
-   */
-  on('security-alert', async (data) => {
-    const sessionId = socket.sessionId;
-    if (!sessionId) return;
-
-    const type = data?.type;
-    if (type !== 'screenshot' && type !== 'recording') return;
-    if (!(await allowAction(socket, 'security-alert', { limit: 3, sourceLimit: 6 }))) {
-      socket.emit('rate-limited', { action: 'security-alert', retryAfterMs: 60_000 });
-      return;
-    }
-
-    const roomData = await getRoomBySessionId(sessionId);
-    if (!roomData) return;
-
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
-    if (!peerSocketId) return;
-
-    io.to(peerSocketId).emit('peer-security-alert', { type, source: 'peer-claim' });
-  });
+  // Typing and device privacy reports travel inside send-encrypted in v4.
+  // There is deliberately no plaintext compatibility endpoint for them.
 
   const handleChannelReady = async (ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
@@ -694,6 +689,8 @@ function registerHandlers(io, socket) {
  * Notifies the peer and destroys the room.
  */
 async function handleDisconnectFromRoom(io, socket) {
+  socket.chatVerified = false;
+  socket.data.recentMessageIds?.clear();
   const sessionId = socket.sessionId;
   if (!sessionId) return;
 
@@ -703,13 +700,13 @@ async function handleDisconnectFromRoom(io, socket) {
   const { roomId } = roomData;
   const peerSocketId = await getPeerSocketId(roomId, sessionId, roomData.room);
 
+  await destroyRoom(roomId);
   if (peerSocketId) {
     io.to(peerSocketId).emit('chat-ended', {
       reasonCode: 'peer_left',
     });
   }
 
-  await destroyRoom(roomId);
 }
 
 /**

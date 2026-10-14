@@ -112,7 +112,9 @@ async function closeRedisConnections() {
 
 async function verifyEphemeralRedisConfiguration() {
   if (!REDIS_URL || process.env.NODE_ENV !== 'production') return;
-  if (process.env.REDIS_REQUIRE_EPHEMERAL !== 'true') return;
+  if (new URL(REDIS_URL).protocol !== 'rediss:') {
+    throw new Error('Production Redis connections must use TLS (rediss://)');
+  }
 
   const client = await getRedisClient();
   let appendOnly;
@@ -125,7 +127,7 @@ async function verifyEphemeralRedisConfiguration() {
   } catch {
     throw new Error('Cannot verify Redis persistence settings; CONFIG GET must be permitted');
   }
-  if (String(appendOnly).toLowerCase() !== 'no' || String(save || '').trim() !== '') {
+  if (typeof save !== 'string' || String(appendOnly).toLowerCase() !== 'no' || save.trim() !== '') {
     throw new Error('Redis persistence must be disabled (appendonly=no and save="")');
   }
 }

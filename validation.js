@@ -5,7 +5,6 @@
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PUBLIC_KEY_RE = /^[A-Za-z0-9+/]{43}=$/;
-const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function isValidSessionId(sessionId) {
   return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId);
@@ -25,11 +24,18 @@ function isValidPublicKey(publicKey) {
 }
 
 function isValidBase64(value, maxCharacters) {
-  return typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= maxCharacters &&
-    value.length % 4 === 0 &&
-    BASE64_RE.test(value);
+  if (typeof value !== 'string' || value.length === 0 ||
+      value.length > maxCharacters || value.length % 4 !== 0) return false;
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  const end = value.length - padding;
+  // Constant stack space even for multi-megabyte attachments. Do not decode
+  // merely to validate: that would allocate another copy of the payload.
+  for (let i = 0; i < end; i += 1) {
+    const c = value.charCodeAt(i);
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+          (c >= 48 && c <= 57) || c === 43 || c === 47)) return false;
+  }
+  return true;
 }
 
 module.exports = { isValidSessionId, isValidMessageId, isValidPublicKey, isValidBase64 };

@@ -1,10 +1,10 @@
 /**
  * server.js - Anonymous Chat Backend
  *
- * ANONYMITY GUARANTEE:
- * - This server stores nothing on disk.
- * - All state lives in RAM (process or Redis) and is destroyed on stop.
- * - No request logging of user data or messages.
+ * One-to-one payloads are forwarded as ciphertext without message history.
+ * Redis session metadata has a separate lifetime from this process.
+ * Deployment logging, persistence, and network privacy require configuration;
+ * see SECURITY_IMPLEMENTATION_PLAN.md for remaining work and limitations.
  */
 
 require('dotenv').config();
@@ -40,6 +40,7 @@ const {
 } = require('./redisClient');
 
 const PORT = process.env.PORT || 3000;
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 
 // --- HTTP Server ---
 const server = http.createServer(app);
@@ -182,7 +183,7 @@ async function start() {
   }
   startSecurityMonitoring();
 
-  server.listen(PORT, () => {
+  server.listen(PORT, BIND_HOST, () => {
     console.log(`Anonymous Chat Backend running on port ${PORT}`);
     console.log(REDIS_URL
       ? 'Privacy mode: messages are never stored; Valkey application state is TTL-bound.'

@@ -104,10 +104,14 @@ async function setSessionRoom(sessionId, roomId) {
 /**
  * Clear room assignment from a session.
  */
-async function clearSessionRoom(sessionId) {
+async function clearSessionRoom(sessionId, expectedRoomId) {
   if (!USE_REDIS) {
     const session = sessions.get(sessionId);
-    if (session) session.roomId = null;
+    if (session && (expectedRoomId === undefined || session.roomId === expectedRoomId)) {
+      session.roomId = null;
+      session.publicKey = null;
+      session.keyConfirmed = false;
+    }
     return;
   }
 
@@ -116,7 +120,10 @@ async function clearSessionRoom(sessionId) {
   if (!raw) return;
   const data = parseEphemeralJson(raw);
   if (!data) return;
+  if (expectedRoomId !== undefined && data.roomId !== expectedRoomId) return;
   data.roomId = null;
+  data.publicKey = null;
+  data.keyConfirmed = false;
   await client.set(KEYS.session(sessionId), JSON.stringify(data), { PX: REDIS_KEY_TTL_MS });
 }
 
