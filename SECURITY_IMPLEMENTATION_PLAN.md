@@ -4,8 +4,8 @@ Prepared: 2026-10-14 (Asia/Karachi).
 Updated: 2026-10-15 (Asia/Karachi): external Redis/Valkey storage removed at the user's request.
 Status: implementation started; untested. The full privacy architecture is NOT implemented. See the implementation handoff below before continuing.
 
-Latest reliability/attachment changes: see `BUGFIX_HANDOFF.md` (October 15).
-Protocol 5 replaces protocol 4 for coordinated client/backend upgrades, adds
+Latest reliability/attachment changes: see `BUGFIX_HANDOFF.md` (October 16, including streamed attachments).
+Protocol 6 supersedes protocols 4/5 for coordinated client/backend upgrades, adds
 bounded encrypted chunks and actual relay-acknowledged progress, and corrects
 volatile delivery and navigation races. No tests or builds were run. The save
 crash still needs device evidence after replacing the Android save path. Local PDF

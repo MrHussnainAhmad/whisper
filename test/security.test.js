@@ -185,7 +185,7 @@ test('production browser origins use an exact HTTPS allow-list', () => {
   assert.equal(policy.allowsRequestOrigin('https://whisperchatapp.duckdns.org.evil.example'), false);
 });
 
-test('self-redemption does not destroy an invite and control fields are allow-listed', async () => {
+test('self-redemption preserves invites and protocol 6 relays encrypted traffic only', { timeout: 15000 }, async () => {
   const inviter = await connectClient();
   const joiner = await connectClient();
   try {
@@ -211,20 +211,22 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     joiner.emit('send-encrypted', { encrypted: 'AAAA' });
     assert.match((await verificationError).message, /Verify chat security/);
 
-    const alertPromise = once(joiner, 'peer-security-alert');
+    let plaintextAlerts = 0;
+    joiner.on('peer-security-alert', () => { plaintextAlerts += 1; });
     inviter.emit('security-alert', { type: 'screenshot', injected: 'removed' });
-    assert.deepEqual(await alertPromise, { type: 'screenshot', source: 'peer-claim' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(plaintextAlerts, 0);
 
     const joinerSeesKey = once(joiner, 'peer-key');
-    inviter.emit('key-exchange', { publicKey: Buffer.alloc(32, 9).toString('base64') });
+    inviter.emit('key-exchange', { publicKey: Buffer.alloc(32, 9).toString('base64'), protocolVersion: 6 });
     await joinerSeesKey;
 
-    const incomplete = await new Promise((resolve) => inviter.emit('verify-chat', resolve));
+    const incomplete = await new Promise((resolve) => inviter.emit('secure-channel-ready', resolve));
     assert.equal(incomplete.ok, false);
     assert.match(incomplete.error || '', /Peer key/i);
 
     const inviterSeesKey = once(inviter, 'peer-key');
-    joiner.emit('key-exchange', { publicKey: Buffer.alloc(32, 3).toString('base64') });
+    joiner.emit('key-exchange', { publicKey: Buffer.alloc(32, 3).toString('base64'), protocolVersion: 6 });
     await inviterSeesKey;
 
     const joinerSeesConfirmation = once(joiner, 'peer-key-confirm');
@@ -235,7 +237,7 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     joiner.emit('key-confirm', { proof: 'BBBB' });
     assert.deepEqual(await inviterSeesConfirmation, { proof: 'BBBB' });
 
-    const verified = await new Promise((resolve) => inviter.emit('verify-chat', resolve));
+    const verified = await new Promise((resolve) => inviter.emit('secure-channel-ready', resolve));
     assert.deepEqual(verified, { ok: true });
 
     const messageId = '20000000-0000-4000-8000-000000000002';
@@ -253,9 +255,12 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     });
     assert.deepEqual(duplicateRelay, { ok: true, messageId, duplicate: true });
 
-    const typingPromise = once(joiner, 'peer-typing');
+    let plaintextTyping = 0;
+    joiner.on('peer-typing', () => { plaintextTyping += 1; });
     inviter.emit('typing', { active: true, injected: 'removed' });
-    assert.deepEqual(await typingPromise, { active: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(plaintextTyping, 0);
+
   } finally {
     inviter.disconnect();
     joiner.disconnect();

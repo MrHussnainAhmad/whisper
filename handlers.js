@@ -292,7 +292,7 @@ function registerHandlers(io, socket) {
     if (!(await allowAction(socket, 'group-message-count', {
       limit: 20, sourceLimit: 40,
     }))) {
-      reply({ ok: false, error: 'Too many messages. Please slow down.' });
+      reply({ ok: false, error: 'Too many messages. Please slow down.', retryable: true, retryAfterMs: 1000 });
       return;
     }
     const result = addMessage(socket.sessionId, data?.text);
@@ -401,7 +401,7 @@ function registerHandlers(io, socket) {
    * KEY EXCHANGE - Relay public key to peer.
    */
   on('key-exchange', async (data) => {
-    if (data?.protocolVersion !== 5) {
+    if (data?.protocolVersion !== 6) {
       socket.emit('error', { message: 'Update the app to establish this chat.' });
       return;
     }
@@ -445,7 +445,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    io.to(peerSocketId).emit('peer-key', { publicKey, protocolVersion: 5 });
+    io.to(peerSocketId).emit('peer-key', { publicKey, protocolVersion: 6 });
   });
 
   /**
@@ -532,19 +532,20 @@ function registerHandlers(io, socket) {
     }
 
     // Includes encrypted receipts, typing, privacy policy and liveness traffic.
-    if (!(await allowAction(socket, 'message-count', { limit: 120, sourceLimit: 240 }))) {
+    if (!(await allowAction(socket, 'message-count', { limit: 120, sourceLimit: 240, windowMs: 1000 }))) {
       socket.emit('error', { message: 'Too many messages. Please slow down.' });
-      reply({ ok: false, error: 'Too many messages. Please slow down.' });
+      reply({ ok: false, error: 'Too many messages. Please slow down.', retryable: true, retryAfterMs: 1000 });
       return;
     }
 
     if (!(await allowAction(socket, 'message-bytes', {
+      windowMs: 1000,
       limit: 8 * 1024 * 1024,
       sourceLimit: 16 * 1024 * 1024,
       cost: Math.max(1, encryptedBytes),
     }))) {
       socket.emit('error', { message: 'Bandwidth limit reached. Please wait.' });
-      reply({ ok: false, error: 'Bandwidth limit reached. Please wait.' });
+      reply({ ok: false, error: 'Bandwidth limit reached. Please wait.', retryable: true, retryAfterMs: 1000 });
       return;
     }
 
@@ -593,7 +594,7 @@ function registerHandlers(io, socket) {
     reply({ ok: true, messageId, duplicate: false });
   });
 
-  // Typing and device privacy reports travel inside send-encrypted in v5.
+  // Typing and device privacy reports travel inside send-encrypted in v6.
   // There is deliberately no plaintext compatibility endpoint for them.
 
   const handleChannelReady = async (ack) => {
