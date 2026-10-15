@@ -25,7 +25,7 @@ const {
   getPeerSocketId,
   destroyRoom,
 } = require('./matchmaking');
-const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite } = require('./invites');
+const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite, getInviteForRequest } = require('./invites');
 const { isValidInviteLocator } = require('./inviteRateLimiter');
 const { isValidMessageId, isValidPublicKey, isValidBase64 } = require('./validation');
 const { allowAction } = require('./abuseLimiter');
@@ -167,6 +167,10 @@ function registerHandlers(io, socket) {
    */
   on('create-invite', async (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    const requestId = data?.requestId;
+    if (requestId !== undefined && !isValidMessageId(requestId)) {
+      reply({ ok: false, error: 'Invalid invite request' }); return;
+    }
     const sessionId = socket.sessionId;
     const session = sessionId ? await getSession(sessionId) : null;
     if (!sessionId || !session) {
@@ -187,6 +191,8 @@ function registerHandlers(io, socket) {
       return;
     }
 
+    const existingLocator = getInviteForRequest(sessionId, requestId);
+    if (existingLocator) { reply({ ok: true, locator: existingLocator }); return; }
     if (!(await allowAction(socket, 'invite-create', {
       limit: 5, sourceLimit: 10, windowMs: 300_000,
     }))) {
@@ -197,11 +203,7 @@ function registerHandlers(io, socket) {
     leaveGroupIfNeeded();
     await resetChatState();
 
-    if (await hasInvite(sessionId)) {
-      await cancelInvite(sessionId);
-    }
-
-    const locator = await createInvite(sessionId, socket.id);
+    const locator = createInvite(sessionId, socket.id, requestId);
     reply({ ok: true, locator });
   });
 
@@ -399,7 +401,7 @@ function registerHandlers(io, socket) {
    * KEY EXCHANGE - Relay public key to peer.
    */
   on('key-exchange', async (data) => {
-    if (data?.protocolVersion !== 4) {
+    if (data?.protocolVersion !== 5) {
       socket.emit('error', { message: 'Update the app to establish this chat.' });
       return;
     }
@@ -443,7 +445,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    io.to(peerSocketId).emit('peer-key', { publicKey, protocolVersion: 4 });
+    io.to(peerSocketId).emit('peer-key', { publicKey, protocolVersion: 5 });
   });
 
   /**
@@ -565,15 +567,33 @@ function registerHandlers(io, socket) {
       return;
     }
 
+    const peer = io.sockets.sockets.get(peerSocketId);
+    if (!socket.chatVerified || getSession(sessionId)?.roomId !== currentRoom.roomId) {
+      reply({ ok: false, error: 'Chat ended' }); return;
+    }
+    if (!peer?.connected) {
+      reply({ ok: false, error: 'Peer disconnected' });
+      return;
+    }
+    const bufferedBytes = (peer.conn.writeBuffer || []).reduce((total, packet) =>
+      total + (typeof packet.data === 'string' ? Buffer.byteLength(packet.data) : packet.data?.byteLength || 0), 0);
+    if (bufferedBytes + encrypted.length > 6 * 1024 * 1024) {
+      reply({ ok: false, error: 'Peer connection is busy', retryable: true });
+      return;
+    }
+    // Another handler may have forwarded this retry while we awaited limits.
+    if (recentMessageIds.has(messageId)) {
+      reply({ ok: true, messageId, duplicate: true }); return;
+    }
     recentMessageIds.add(messageId);
     if (recentMessageIds.size > 200) {
       recentMessageIds.delete(recentMessageIds.values().next().value);
     }
-    io.to(peerSocketId).volatile.emit('receive-encrypted', { encrypted, messageId });
+    io.to(peerSocketId).emit('receive-encrypted', { encrypted, messageId });
     reply({ ok: true, messageId, duplicate: false });
   });
 
-  // Typing and device privacy reports travel inside send-encrypted in v4.
+  // Typing and device privacy reports travel inside send-encrypted in v5.
   // There is deliberately no plaintext compatibility endpoint for them.
 
   const handleChannelReady = async (ack) => {
@@ -584,7 +604,8 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Not in a chat' });
       return;
     }
-    if (!(await allowAction(socket, 'secure-channel-ready', { limit: 2, sourceLimit: 6 }))) {
+    if (socket.chatVerified) { reply({ ok: true }); return; }
+    if (!(await allowAction(socket, 'secure-channel-ready', { limit: 12, sourceLimit: 24 }))) {
       reply({ ok: false, error: 'Rate limited' });
       return;
     }
@@ -664,9 +685,10 @@ function registerHandlers(io, socket) {
   /**
    * LEAVE ROOM - Voluntarily end the chat.
    */
-  on('leave-room', async () => {
+  on('leave-room', async (data, ack) => {
     leaveGroupIfNeeded();
     await handleDisconnectFromRoom(io, socket);
+    if (typeof ack === 'function') ack({ ok: true });
   });
 
   /**

@@ -27,16 +27,26 @@ function generateInviteLocator() {
   return `TALK-${body.match(/.{4}/g).join('-')}`;
 }
 
-function createInvite(sessionId, socketId) {
+function createInvite(sessionId, socketId, requestId = null) {
+  const existing = getInviteForRequest(sessionId, requestId);
+  if (existing) return existing;
   cancelInvite(sessionId);
   for (let attempt = 0; attempt < 20; attempt++) {
     const locator = generateInviteLocator();
     if (!invites.has(locator)) {
-      invites.set(locator, { sessionId, socketId, createdAt: Date.now() });
+      invites.set(locator, { sessionId, socketId, requestId, createdAt: Date.now() });
       return locator;
     }
   }
   throw new Error('Failed to allocate invite locator');
+}
+
+function getInviteForRequest(sessionId, requestId) {
+  if (!requestId) return null;
+  for (const [locator, invite] of invites) {
+    if (invite.sessionId === sessionId && invite.requestId === requestId && getInvite(locator)) return locator;
+  }
+  return null;
 }
 
 function getInvite(locator) {
@@ -86,6 +96,7 @@ function _restoreInvite(locator, invite) {
   invites.set(locator, {
     sessionId: invite.sessionId,
     socketId: invite.socketId,
+    requestId: invite.requestId || null,
     createdAt: invite.createdAt || Date.now(),
   });
   return true;
@@ -107,6 +118,7 @@ async function cleanupExpiredInvites() {
 
 module.exports = {
   createInvite,
+  getInviteForRequest,
   getInvite,
   consumeInvite,
   cancelInvite,
