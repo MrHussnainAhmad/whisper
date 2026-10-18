@@ -1,5 +1,16 @@
 # Private relay deployment prerequisites
 
+Current deployment behavior (October 18, 2026): the mobile app uses direct
+HTTPS, not Tor. The topology below is a future architecture, not a description
+of the current service. See SECURITY_HARDENING.md in the repository root.
+
+Production requires NODE_ENV=production. For a same-host reverse proxy, set
+TRUST_PROXY=1 and TRUST_PROXY_CIDRS=127.0.0.1/32,::1/128. Use the actual proxy
+CIDRs for other topologies and restrict inbound Node access to those proxies.
+The proxy must overwrite forwarding headers. Set ALLOW_UNVERIFIED_CHATS=false
+to retain the default invite-only mode. Upgrade the backend and app together
+for protocol 7; older clients are rejected. New native app builds are required.
+
 These are preparation files, not a deployed or verified Tor service.
 
 The backend now binds to `127.0.0.1` unless `BIND_HOST` is explicitly set.
@@ -39,9 +50,7 @@ Tor connections converge on local/proxy addresses, and a per-source cap can
 incorrectly block the entire service. Do not solve this by adding original-IP
 forwarding. Use bounded anonymous admission/session budgets instead.
 
-The mobile release build intentionally refuses direct chat connections until
-the real anonymous transport is integrated. Development can explicitly opt
-into direct HTTPS using `EXPO_PUBLIC_ALLOW_DIRECT_DEV=true` and
-`EXPO_PUBLIC_SERVER_URL`; that mode exposes source IPs and must never be
-marketed as anonymous routing. No build/runtime verification has been run in
-this implementation session, at the user's request.
+The current mobile release build connects directly over HTTPS using
+EXPO_PUBLIC_SERVER_URL. There is no anonymous-transport gate or Tor fallback.
+Do not advertise IP anonymity. Source tests are separate from inspection of
+the actual production proxy, host, logs, certificates and firewall.

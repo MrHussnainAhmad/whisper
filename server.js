@@ -15,6 +15,9 @@ const { Server } = require('socket.io');
 const { app, CORS_ORIGIN, ORIGIN_POLICY } = require('./app');
 const { registerHandlers } = require('./handlers');
 const { requireSecureSocket, ENFORCE_HTTPS } = require('./security');
+const { requireHttps, securityHeaders } = require('./security');
+const { httpRateLimit } = require('./httpLimiter');
+const { createTransportAdmission } = require('./transportAdmission');
 const { addSession, removeSession, setExpireHandler } = require('./sessions');
 const { acquireConnection, releaseConnection } = require('./abuseLimiter');
 const {
@@ -41,6 +44,7 @@ server.keepAliveTimeout = 5_000;
 server.maxRequestsPerSocket = 100;
 
 // --- Socket.IO Setup ---
+const transportAdmission = createTransportAdmission(ORIGIN_POLICY);
 const io = new Server(server, {
   cors: {
     origin: CORS_ORIGIN,
@@ -48,13 +52,19 @@ const io = new Server(server, {
     credentials: false,
     maxAge: 600,
   },
-  allowRequest: (req, callback) => {
-    callback(null, ORIGIN_POLICY.allowsRequestOrigin(req.headers.origin));
-  },
-  maxHttpBufferSize: 6 * 1024 * 1024,
+  allowRequest: transportAdmission.allowRequest,
+  maxHttpBufferSize: 288 * 1024,
   pingTimeout: 30000,
   pingInterval: 25000,
+  connectTimeout: 10_000,
 });
+
+// Engine.IO bypasses Express routes. Apply transport checks to polling and
+// WebSocket upgrade requests as well as the initial handshake.
+io.engine.use(requireHttps);
+io.engine.use(securityHeaders);
+io.engine.use((req, res, next) => req._query?.sid ? next() : httpRateLimit(req, res, next));
+io.engine.on('connection', transportAdmission.onConnection);
 
 /**
  * Handle session expiration cleanup from sessions.js

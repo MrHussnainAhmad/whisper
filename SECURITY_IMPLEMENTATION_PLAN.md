@@ -1,5 +1,10 @@
 # One-to-one privacy implementation plan and next-session handoff
 
+> Superseded status, October 18, 2026: see SECURITY_HARDENING.md for current
+> changes and validation. The source now uses protocol 7, direct HTTPS, and
+> invite-only defaults. The historical release gate and testing prohibition
+> described below do not describe the current implementation/session.
+
 Prepared: 2026-10-14 (Asia/Karachi).
 Updated: 2026-10-15 (Asia/Karachi): external Redis/Valkey storage removed at the user's request.
 Status: implementation started; untested. The full privacy architecture is NOT implemented. See the implementation handoff below before continuing.

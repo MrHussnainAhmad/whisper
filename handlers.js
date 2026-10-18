@@ -1,7 +1,7 @@
 /**
  * handlers.js - Socket.IO Event Handlers
  *
- * ANONYMITY GUARANTEE:
+ * APPLICATION DATA HANDLING (not an anonymity guarantee):
  * - 1-to-1 messages are relayed in real-time and never stored.
  * - Group messages are relayed live and never retained by the backend.
  * - Images are forwarded as base64 payloads and never written to disk.
@@ -27,7 +27,7 @@ const {
 } = require('./matchmaking');
 const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite, getInviteForRequest } = require('./invites');
 const { isValidInviteLocator } = require('./inviteRateLimiter');
-const { isValidMessageId, isValidPublicKey, isValidBase64 } = require('./validation');
+const { isValidMessageId, isValidKeyBundle, isValidBase64 } = require('./validation');
 const { allowAction } = require('./abuseLimiter');
 const { recordSecurityEvent } = require('./securityMonitor');
 const {
@@ -44,9 +44,10 @@ const {
 } = require('./groupChat');
 
 // Max encrypted payload bytes (server cannot inspect message type due to E2E).
-const MAX_ENCRYPTED_BYTES = 4 * 1024 * 1024;
+const MAX_ENCRYPTED_BYTES = 192 * 1024;
 const MAX_ENCRYPTED_BASE64_CHARS = Math.ceil(MAX_ENCRYPTED_BYTES / 3) * 4;
-const MAX_KEY_CONFIRM_BASE64_CHARS = 512;
+const MAX_KEY_CONFIRM_BASE64_CHARS = 16384;
+const ALLOW_UNVERIFIED_CHATS = process.env.ALLOW_UNVERIFIED_CHATS === 'true';
 
 function estimateBase64Bytes(b64) {
   if (!b64) return 0;
@@ -60,6 +61,11 @@ function estimateBase64Bytes(b64) {
  */
 function registerHandlers(io, socket) {
   setGroupStatusListener((status) => io.emit('group-status', status));
+  socket.use((_packet, next) => {
+    allowAction(socket, 'all-events', { limit: 100, sourceLimit: 200, globalLimit: 10000, windowMs: 1000 })
+      .then((allowed) => { if (allowed) next(); else socket.disconnect(true); })
+      .catch(() => socket.disconnect(true));
+  });
 
   let pendingHandlers = 0;
   const on = (event, handler) => {
@@ -112,6 +118,11 @@ function registerHandlers(io, socket) {
   on('find-random', async (data, ack) => {
     if (typeof data === 'function') ack = data;
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    if (!ALLOW_UNVERIFIED_CHATS) {
+      reply({ ok: false, error: 'Use a private invite. Random chat is disabled.' });
+      socket.emit('error', { message: 'Use a private invite. Random chat is disabled.' });
+      return;
+    }
     const sessionId = socket.sessionId;
     const session = sessionId ? await getSession(sessionId) : null;
     if (!sessionId || !session) {
@@ -214,6 +225,7 @@ function registerHandlers(io, socket) {
   on('group-captcha', async (data, ack) => {
     if (typeof data === 'function') ack = data;
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    if (!ALLOW_UNVERIFIED_CHATS) { reply({ ok: false, error: 'Public group chat is disabled.' }); return; }
     if (!(await allowAction(socket, 'group-captcha', { limit: 8, sourceLimit: 20 }))) {
       reply({ ok: false, error: 'Too many attempts. Please wait.' });
       return;
@@ -233,6 +245,7 @@ function registerHandlers(io, socket) {
 
   on('join-group', async (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
+    if (!ALLOW_UNVERIFIED_CHATS) { reply({ ok: false, error: 'Public group chat is disabled.' }); return; }
     const sessionId = socket.sessionId;
     const session = sessionId ? await getSession(sessionId) : null;
     if (!sessionId || !session) {
@@ -401,7 +414,7 @@ function registerHandlers(io, socket) {
    * KEY EXCHANGE - Relay public key to peer.
    */
   on('key-exchange', async (data) => {
-    if (data?.protocolVersion !== 5) {
+    if (data?.protocolVersion !== 7) {
       socket.emit('error', { message: 'Update the app to establish this chat.' });
       return;
     }
@@ -411,8 +424,8 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    const { publicKey } = data || {};
-    if (!isValidPublicKey(publicKey)) {
+    const publicKey = data?.keyBundle;
+    if (!isValidKeyBundle(publicKey)) {
       recordSecurityEvent('invalid-public-key');
       socket.emit('error', { message: 'Invalid key exchange payload.' });
       return;
@@ -445,7 +458,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    io.to(peerSocketId).emit('peer-key', { publicKey, protocolVersion: 5 });
+    io.to(peerSocketId).emit('peer-key', { keyBundle: publicKey, protocolVersion: 7 });
   });
 
   /**
@@ -532,19 +545,19 @@ function registerHandlers(io, socket) {
     }
 
     // Includes encrypted receipts, typing, privacy policy and liveness traffic.
-    if (!(await allowAction(socket, 'message-count', { limit: 120, sourceLimit: 240 }))) {
-      socket.emit('error', { message: 'Too many messages. Please slow down.' });
-      reply({ ok: false, error: 'Too many messages. Please slow down.' });
+    if (!(await allowAction(socket, 'message-count', { limit: 40, sourceLimit: 80, globalLimit: 4000, windowMs: 1000 }))) {
+      reply({ ok: false, error: 'Too many messages. Please slow down.', retryable: true });
       return;
     }
 
     if (!(await allowAction(socket, 'message-bytes', {
       limit: 8 * 1024 * 1024,
       sourceLimit: 16 * 1024 * 1024,
+      globalLimit: 64 * 1024 * 1024,
+      windowMs: 1000,
       cost: Math.max(1, encryptedBytes),
     }))) {
-      socket.emit('error', { message: 'Bandwidth limit reached. Please wait.' });
-      reply({ ok: false, error: 'Bandwidth limit reached. Please wait.' });
+      reply({ ok: false, error: 'Bandwidth limit reached. Please wait.', retryable: true });
       return;
     }
 
@@ -577,7 +590,7 @@ function registerHandlers(io, socket) {
     }
     const bufferedBytes = (peer.conn.writeBuffer || []).reduce((total, packet) =>
       total + (typeof packet.data === 'string' ? Buffer.byteLength(packet.data) : packet.data?.byteLength || 0), 0);
-    if (bufferedBytes + encrypted.length > 6 * 1024 * 1024) {
+    if (bufferedBytes + encrypted.length > 2 * 1024 * 1024) {
       reply({ ok: false, error: 'Peer connection is busy', retryable: true });
       return;
     }
@@ -593,7 +606,7 @@ function registerHandlers(io, socket) {
     reply({ ok: true, messageId, duplicate: false });
   });
 
-  // Typing and device privacy reports travel inside send-encrypted in v5.
+  // Typing and device privacy reports travel inside send-encrypted in v7.
   // There is deliberately no plaintext compatibility endpoint for them.
 
   const handleChannelReady = async (ack) => {

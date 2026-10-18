@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { requireHttps, securityHeaders } = require('./security');
-const { TRUST_PROXY_HOPS } = require('./networkConfig');
+const { trustProxy } = require('./networkConfig');
 const { httpRateLimit } = require('./httpLimiter');
 const { createOriginPolicy } = require('./corsPolicy');
 
@@ -16,7 +16,7 @@ const app = express();
 app.disable('x-powered-by');
 
 // Trust reverse proxy (nginx/Caddy) for X-Forwarded-Proto
-app.set('trust proxy', TRUST_PROXY_HOPS);
+app.set('trust proxy', trustProxy);
 
 app.use(requireHttps);
 app.use(securityHeaders);

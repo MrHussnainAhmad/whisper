@@ -23,6 +23,12 @@ function isValidPublicKey(publicKey) {
   }
 }
 
+function isValidKeyBundle(value) {
+  if (!isValidBase64(value, 16384) || value.length < 128) return false;
+  const bytes = Buffer.from(value, 'base64');
+  return bytes[0] === 7 && bytes.toString('base64') === value;
+}
+
 function isValidBase64(value, maxCharacters) {
   if (typeof value !== 'string' || value.length === 0 ||
       value.length > maxCharacters || value.length % 4 !== 0) return false;
@@ -38,4 +44,4 @@ function isValidBase64(value, maxCharacters) {
   return true;
 }
 
-module.exports = { isValidSessionId, isValidMessageId, isValidPublicKey, isValidBase64 };
+module.exports = { isValidSessionId, isValidMessageId, isValidPublicKey, isValidKeyBundle, isValidBase64 };

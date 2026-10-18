@@ -7,11 +7,11 @@
 
 // Production HTTPS enforcement cannot be disabled by environment flags.
 const ENFORCE_HTTPS = process.env.NODE_ENV === 'production';
-const { TRUST_PROXY_HOPS } = require('./networkConfig');
+const { trustProxy } = require('./networkConfig');
 
 function isSecureRequest(req) {
   if (req.secure || req.socket?.encrypted === true || req.connection?.encrypted === true) return true;
-  if (TRUST_PROXY_HOPS === 0) return false;
+  if (!req.socket?.remoteAddress || !trustProxy(req.socket.remoteAddress, 0)) return false;
   const forwarded = req.headers['x-forwarded-proto'];
   if (typeof forwarded === 'string') {
     const proto = forwarded.split(',')[0].trim().toLowerCase();
@@ -24,7 +24,9 @@ function requireHttps(req, res, next) {
   if (!ENFORCE_HTTPS || isSecureRequest(req)) {
     return next();
   }
-  return res.status(403).json({ error: 'HTTPS required' });
+  res.statusCode = 403;
+  res.setHeader('Content-Type', 'application/json');
+  return res.end(JSON.stringify({ error: 'HTTPS required' }));
 }
 
 function securityHeaders(req, res, next) {

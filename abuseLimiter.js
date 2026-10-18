@@ -2,7 +2,7 @@
 const crypto = require('crypto');
 const proxyaddr = require('proxy-addr');
 const ipaddr = require('ipaddr.js');
-const { TRUST_PROXY_HOPS } = require('./networkConfig');
+const { TRUST_PROXY_HOPS, trustProxy } = require('./networkConfig');
 const { recordSecurityEvent } = require('./securityMonitor');
 
 function positiveIntegerEnv(name, fallback) {
@@ -17,6 +17,8 @@ const MAX_RATE_LIMIT_BUCKETS = positiveIntegerEnv('MAX_RATE_LIMIT_BUCKETS', 100_
 const counters = new Map();
 const connections = new Map();
 const globalConnections = new Set();
+// A process-local secret prevents offline enumeration of IPv4 limiter labels.
+const sourceSecret = crypto.randomBytes(32);
 
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -43,12 +45,12 @@ function getSourceKey(socket) {
   let address = socket.request?.socket?.remoteAddress || socket.handshake?.address || 'unknown';
   if (TRUST_PROXY_HOPS > 0 && socket.request) {
     try {
-      address = proxyaddr(socket.request, (_addr, index) => index < TRUST_PROXY_HOPS);
+      address = proxyaddr(socket.request, trustProxy);
     } catch {
       // Fall back to the transport address when forwarding headers are malformed.
     }
   }
-  return crypto.createHash('sha256').update(normalizeSource(address)).digest('hex');
+  return crypto.createHmac('sha256', sourceSecret).update(normalizeSource(address)).digest('hex');
 }
 
 async function acquireConnection(socket) {
@@ -118,6 +120,11 @@ async function allowAction(socket, action, options = {}) {
   const sourceKey = socket.data?.sourceKey;
   const sessionId = socket.sessionId;
   if (!sourceKey || !sessionId || !Number.isFinite(cost) || cost < 1) return false;
+
+  if (options.globalLimit && !consumeMemory(`${action}:global`, 'all', options.globalLimit, windowMs, cost)) {
+    recordSecurityEvent('socket-global-rate-limited');
+    return false;
+  }
 
   if (!consumeMemory(`${action}:source`, sourceKey, sourceLimit, windowMs, cost)) {
     recordSecurityEvent('socket-rate-limited');

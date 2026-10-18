@@ -1,12 +1,10 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const net = require('node:net');
-const path = require('node:path');
-const { spawn } = require('node:child_process');
 const { before, after, test } = require('node:test');
 const { io } = require('socket.io-client');
+const { startServer } = require('./serverFixture.cjs');
 
-const { isValidMessageId, isValidPublicKey, isValidBase64 } = require('../validation');
+const { isValidMessageId, isValidPublicKey, isValidKeyBundle, isValidBase64 } = require('../validation');
 const { isValidInviteLocator } = require('../inviteRateLimiter');
 const { createInvite, getInvite, consumeInvite } = require('../invites');
 const { normalizeSource } = require('../abuseLimiter');
@@ -19,15 +17,11 @@ let serverProcess;
 let serverUrl;
 
 function once(socket, event) {
-  return new Promise((resolve) => socket.once(event, resolve));
-}
-
-async function getFreePort() {
-  const server = net.createServer();
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
-  await new Promise((resolve) => server.close(resolve));
-  return port;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { socket.off(event, handler); reject(new Error(`${event} timed out`)); }, 5000);
+    const handler = (data) => { clearTimeout(timer); resolve(data); };
+    socket.once(event, handler);
+  });
 }
 
 async function connectClient() {
@@ -36,7 +30,7 @@ async function connectClient() {
     reconnection: false,
     forceNew: true,
   });
-  await once(socket, 'joined');
+  try { await once(socket, 'joined'); } catch (error) { socket.disconnect(); throw error; }
   return socket;
 }
 
@@ -77,41 +71,22 @@ function solveProofOfWork(captcha) {
 }
 
 before(async () => {
-  const port = await getFreePort();
-  serverUrl = `http://127.0.0.1:${port}`;
-  serverProcess = spawn(process.execPath, ['server.js'], {
-    cwd: path.resolve(__dirname, '..'),
-    env: {
-      ...process.env,
-      NODE_ENV: 'development',
-      PORT: String(port),
-      TRUST_PROXY: '0',
-      REDIS_URL: '',
-      VALKEY_URL: '',
-      GROUP_POW_DIFFICULTY_BITS: '4',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Server startup timed out')), 5000);
-    serverProcess.once('exit', (code) => reject(new Error(`Server exited with ${code}`)));
-    serverProcess.stdout.on('data', (chunk) => {
-      if (chunk.toString().includes('running on port')) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-  });
+  const fixture = await startServer({ ALLOW_UNVERIFIED_CHATS: 'true', GROUP_POW_DIFFICULTY_BITS: '4' });
+  serverProcess = fixture.child;
+  serverUrl = fixture.url;
 });
 
-after(() => {
-  serverProcess?.kill();
-});
+after(() => { serverProcess?.kill(); });
 
 test('strict key and ciphertext validation rejects malformed inputs', () => {
   assert.equal(isValidPublicKey(Buffer.alloc(32, 7).toString('base64')), true);
   assert.equal(isValidPublicKey('not-a-key'), false);
+  const bundle = Buffer.concat([Buffer.from([7]), Buffer.alloc(128, 9)]);
+  assert.equal(isValidKeyBundle(bundle.toString('base64')), true);
+  bundle[0] = 6;
+  assert.equal(isValidKeyBundle(bundle.toString('base64')), false);
+  assert.equal(isValidKeyBundle(Buffer.alloc(32).toString('base64')), false);
+  assert.equal(isValidKeyBundle('A'.repeat(16388)), false);
   assert.equal(isValidBase64('AAAA', 16), true);
   assert.equal(isValidBase64('AAAA!', 16), false);
   assert.equal(isValidBase64('A'.repeat(20), 16), false);
@@ -189,9 +164,7 @@ test('self-redemption does not destroy an invite and control fields are allow-li
   const inviter = await connectClient();
   const joiner = await connectClient();
   try {
-    const createResult = await new Promise((resolve) => {
-      inviter.emit('create-invite', { locator: 'TALK-AAAA-AAAA-AAAA-AAAA' }, resolve);
-    });
+    const createResult = await emitAck(inviter, 'create-invite', { locator: 'TALK-AAAA-AAAA-AAAA-AAAA' });
     assert.equal(createResult.ok, true);
     const locator = createResult.locator;
     assert.equal(isValidInviteLocator(locator), true);
@@ -211,20 +184,26 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     joiner.emit('send-encrypted', { encrypted: 'AAAA' });
     assert.match((await verificationError).message, /Verify chat security/);
 
-    const alertPromise = once(joiner, 'peer-security-alert');
+    const leakedControls = [];
+    joiner.on('peer-security-alert', (data) => leakedControls.push(data));
+    joiner.on('peer-typing', (data) => leakedControls.push(data));
     inviter.emit('security-alert', { type: 'screenshot', injected: 'removed' });
-    assert.deepEqual(await alertPromise, { type: 'screenshot', source: 'peer-claim' });
+    inviter.emit('typing', { active: true });
+
+    const downgradeError = once(inviter, 'error');
+    inviter.emit('key-exchange', { publicKey: Buffer.alloc(32, 9).toString('base64'), protocolVersion: 6 });
+    assert.match((await downgradeError).message, /Update/);
 
     const joinerSeesKey = once(joiner, 'peer-key');
-    inviter.emit('key-exchange', { publicKey: Buffer.alloc(32, 9).toString('base64') });
-    await joinerSeesKey;
+    inviter.emit('key-exchange', { keyBundle: Buffer.concat([Buffer.from([7]), Buffer.alloc(128, 9)]).toString('base64'), protocolVersion: 7 });
+    assert.equal((await joinerSeesKey).protocolVersion, 7);
 
-    const incomplete = await new Promise((resolve) => inviter.emit('verify-chat', resolve));
+    const incomplete = await emitAck(inviter, 'secure-channel-ready');
     assert.equal(incomplete.ok, false);
     assert.match(incomplete.error || '', /Peer key/i);
 
     const inviterSeesKey = once(inviter, 'peer-key');
-    joiner.emit('key-exchange', { publicKey: Buffer.alloc(32, 3).toString('base64') });
+    joiner.emit('key-exchange', { keyBundle: Buffer.concat([Buffer.from([7]), Buffer.alloc(128, 3)]).toString('base64'), protocolVersion: 7 });
     await inviterSeesKey;
 
     const joinerSeesConfirmation = once(joiner, 'peer-key-confirm');
@@ -235,7 +214,7 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     joiner.emit('key-confirm', { proof: 'BBBB' });
     assert.deepEqual(await inviterSeesConfirmation, { proof: 'BBBB' });
 
-    const verified = await new Promise((resolve) => inviter.emit('verify-chat', resolve));
+    const verified = await emitAck(inviter, 'secure-channel-ready');
     assert.deepEqual(verified, { ok: true });
 
     const messageId = '20000000-0000-4000-8000-000000000002';
@@ -253,9 +232,7 @@ test('self-redemption does not destroy an invite and control fields are allow-li
     });
     assert.deepEqual(duplicateRelay, { ok: true, messageId, duplicate: true });
 
-    const typingPromise = once(joiner, 'peer-typing');
-    inviter.emit('typing', { active: true, injected: 'removed' });
-    assert.deepEqual(await typingPromise, { active: true });
+    assert.deepEqual(leakedControls, []);
   } finally {
     inviter.disconnect();
     joiner.disconnect();

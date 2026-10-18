@@ -1,8 +1,7 @@
 /** Small in-memory limiter for the public HTTP probe routes. Socket abuse
  * controls are handled separately in abuseLimiter.js. No source values are
  * logged or persisted. */
-const { normalizeSource } = require('./abuseLimiter');
-const crypto = require('crypto');
+const { getSourceKey } = require('./abuseLimiter');
 const { recordSecurityEvent } = require('./securityMonitor');
 
 const WINDOW_MS = 60_000;
@@ -28,18 +27,20 @@ function httpRateLimit(req, res, next) {
   if (globalWindow.count > GLOBAL_LIMIT) {
     recordSecurityEvent('http-global-limit');
     res.setHeader('Retry-After', '60');
-    return res.status(429).json({ error: 'Too many requests' });
+    res.statusCode = 429;
+    res.setHeader('Content-Type', 'application/json');
+    return res.end(JSON.stringify({ error: 'Too many requests' }));
   }
 
-  const source = crypto.createHash('sha256')
-    .update(normalizeSource(req.ip || req.socket?.remoteAddress || 'unknown'))
-    .digest('hex');
+  const source = getSourceKey({ request: req });
   const result = take(sources.get(source), SOURCE_LIMIT, now);
   sources.set(source, result.entry);
   if (!result.allowed) {
     recordSecurityEvent('http-source-limit');
     res.setHeader('Retry-After', '60');
-    return res.status(429).json({ error: 'Too many requests' });
+    res.statusCode = 429;
+    res.setHeader('Content-Type', 'application/json');
+    return res.end(JSON.stringify({ error: 'Too many requests' }));
   }
   return next();
 }
