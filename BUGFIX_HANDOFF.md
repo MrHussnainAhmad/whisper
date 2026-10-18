@@ -102,3 +102,116 @@ PDF rendering/flattening/export; Office conversion/oversized malformed archives;
 media remux compatibility and container metadata; document-provider cancellation;
 and repeated chat teardown/reconnection. Update protocol fixtures before relying
 on the existing test suite.
+
+## Expo Go / invite follow-up
+
+Source review found that iOS Expo Go lacks WhisperPrivacy, so protection setup
+rejects after matching and the other peer receives a normal leave event. Random
+matching and invite create/join now check protection before contacting the relay,
+with an explicit installed-build requirement. Protection is not bypassed for Expo Go.
+QR modules are now black in both themes; dark mode previously rendered white
+modules on the white quiet-zone background. Displayed invites clear on disconnect
+and expire conservatively after 290 seconds. Removed hidden double-tap invite
+cancellation; the explicit close button remains. Invite joining now awaits the
+preflight and avoids adding a timeout after a match/error already completed.
+The reported server 'not found or expired' error has not been reproduced against
+the deployed service. Verify current native clients and backend protocol 5, the
+same server origin, and a single backend process holding the in-memory locator.
+
+## QR image sharing
+
+Home's Share QR action and the QR modal now export an actual image/png file with
+expo-sharing, replacing the text-only React Native Share action. The PNG is
+encoded from the same QR matrix used on screen (8-pixel modules, four-module
+white border), without screen capture or relaxing capture protection. Temporary
+files use random filenames under the existing export-cache cleanup directory and
+are deleted after the share sheet returns. The image contains the complete invite
+secret by design; copies in recipient apps remain until those apps remove them.
+PNG checksums, dimensions, decoded pixel data and quiet-zone rendering were
+checked locally. OS share-sheet delivery still needs physical-device verification.
+
+## Camera and attachment picker — October 16, 2026
+
+- Replaced the external system-camera/photo-or-video alert with ChatCamera in the
+  protected chat window. Photo/Video modes, front/back camera, record/stop, and
+  review with Retake/Use are available. Video stays within the existing 30-second
+  and 3 MB attachment constraints (recording stops at 2.8 MB to leave container
+  overhead). Microphone permission is requested when selecting Video.
+- Selection and processing are separate states. No processing modal is displayed
+  over permissions, the photo/video library, or the camera. A small Preparing
+  indicator appears only after selection. iOS waits for attachment-sheet dismissal
+  before presenting the library picker.
+- Captures use expo-camera's private Camera cache; no gallery-save API or external
+  camera activity is invoked. Cancel/Retake, late capture completion after closure,
+  normal preparation and app restart clean app-owned temporary captures. No secure
+  flash erasure or memory-only recording guarantee is made. Previously saved
+  gallery items are not deleted. Native remux and resized-photo caches retain their
+  existing cleanup paths.
+- The camera stays under the privacy cover during transient permission prompts,
+  closes on backgrounding, and does not open a separate unprotected modal window.
+- iOS and Android JS exports passed. Physical-device camera permissions, record/stop/size limit,
+  review cancellation, Photos/Gallery absence and interrupted-session cleanup still
+  require device validation; no native build or deployment was performed.
+
+## Capture quality and storage clarification
+
+The user clarified that private temporary storage is acceptable; the requirement
+is no automatic saving to Photos/Gallery/shared storage, including received media.
+Explicit sender-authorized Save remains a separate export action.
+Photo capture now requests maximum JPEG quality and the largest enumerated Android
+photo size (iOS Photo preset). Photo preparation no longer resizes to 1600 pixels
+and re-encodes at JPEG quality 1 for normalization/metadata removal. This is not RAW
+or mathematically lossless capture. Video requests 2160p with camera-library
+fallback to supported quality; the previous 480p/600 kbps override is removed.
+The 3 MB transfer cap remains. Large photos are rejected without silent quality
+reduction, and video recording can reach its size cap quickly at high quality.
+Native camera capabilities, actual resolution and gallery behavior require device
+verification. No automatic gallery-save or media-library write was introduced.
+
+## Large media streaming — October 16, 2026 (supersedes 3 MB transport limit)
+
+Protocol 6 is required on BOTH native clients and the backend. Upgrade together;
+no deployment or native build was performed in this pass. Protocol 5 clients are
+rejected during key exchange. Session/key-confirmation domain labels and encrypted
+envelope version changed together.
+
+There is no fixed total attachment byte cap on the new file-backed transport.
+96 KiB chunks are encrypted independently, four per transfer in flight, and
+paced by encrypted recipient acknowledgements. At most two outgoing/incoming
+transfers are admitted concurrently. Chunk count/size/descriptor validation,
+bounded reordering, safe integer checks and actual disk-space checks remain.
+Incoming timeout is 60 seconds of inactivity, not a total transfer duration.
+Receiver files are created under generated UUID names, never peer-supplied paths.
+Peer fileUri properties are rejected; local URIs are created only by the receiver.
+
+Attachments reside in PRIVATE TEMPORARY PLAINTEXT FILES on devices. They are
+removed at chat reset and initialization, with cleanup on incomplete/error paths.
+No automatic Photos/Gallery/shared-storage export is added. RAM-only claims from
+earlier milestones no longer describe attachment storage. No forensic-erasure
+guarantee is made. Explicit authorized Save copies a file using a bounded native
+stream on Android or the iOS share sheet. JPEG branding/metadata removal streams
+the compressed image; large documents do not receive universal metadata branding.
+
+Video remux returns a private file URI instead of a complete Base64 payload;
+recording's 30-second/2.8 MB cutoff is removed. Native sample buffers are bounded;
+unsupported codecs or unusually large individual frames may still fail. JPEG
+preparation preserves full resolution and does not load compressed file data into
+one Base64 string. Pixel decoding still requires image-sized native memory.
+
+Existing bounded PDF/Office conversion and preview limits are separate from
+transfer size. Large/unsupported files require explicit consent to send the
+original (including original metadata). Preview of large documents can be
+unavailable even when transfer/export succeeds. Storage, network loss, session
+expiry, OS capture restrictions and device resources still bound operation.
+
+Relay rate limits now use one-second windows (120 packets / 8 MiB per connection,
+240 packets / 16 MiB per source), rather than exhausting the previous minute
+budget halfway through large transfers. Rate responses provide bounded retries;
+transport queue backpressure remains. Progress is recipient-acknowledged bytes.
+
+Validation: 17 MiB-plus-seven-byte receiver transfer with reordered four-chunk
+windows compared byte-for-byte; malformed size/order/descriptor cleanup and chat
+teardown cleanup pass. Mobile crypto/reconnect tests pass (9 tests combined).
+Backend tests updated from obsolete plaintext security events to protocol 6 and
+all 13 pass. Android/iOS JS exports pass. Native video/export methods and actual
+phone disk-space/camera/lifecycle behavior still require device/build validation.
