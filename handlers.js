@@ -419,14 +419,17 @@ function registerHandlers(io, socket) {
   /**
    * KEY EXCHANGE - Relay public key to peer.
    */
-  on('key-exchange', async (data) => {
+  on('key-exchange', async (data, ack) => {
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
     if (data?.protocolVersion !== 7) {
       socket.emit('error', { message: 'Update the app to establish this chat.' });
+      reply({ ok: false, error: 'Unsupported protocol' });
       return;
     }
     const sessionId = socket.sessionId;
     if (!sessionId) {
       socket.emit('error', { message: 'Session not found' });
+      reply({ ok: false, error: 'Session not found' });
       return;
     }
 
@@ -434,16 +437,19 @@ function registerHandlers(io, socket) {
     if (!isValidKeyBundle(publicKey)) {
       recordSecurityEvent('invalid-public-key');
       socket.emit('error', { message: 'Invalid key exchange payload.' });
+      reply({ ok: false, error: 'Invalid key exchange payload.' });
       return;
     }
 
     if (!(await allowAction(socket, 'key-exchange', { limit: 4, sourceLimit: 12 }))) {
       socket.emit('rate-limited', { action: 'key-exchange', retryAfterMs: 60_000 });
+      reply({ ok: false, error: 'Rate limited' });
       return;
     }
 
     if (socket.data.publicKey && socket.data.publicKey !== publicKey) {
       socket.emit('error', { message: 'Security key changed during this chat.' });
+      reply({ ok: false, error: 'Security key changed during this chat.' });
       return;
     }
     if (!socket.data.publicKey) {
@@ -455,44 +461,55 @@ function registerHandlers(io, socket) {
     const roomData = await getRoomBySessionId(sessionId);
     if (!roomData) {
       socket.emit('error', { message: 'Not in a chat' });
+      reply({ ok: false, error: 'Not in a chat' });
       return;
     }
 
     const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) {
-      socket.emit('error', { message: 'Peer is unavailable' });
+      // The key is registered; the peer receives it when it announces chat-ready.
+      reply({ ok: true, relayed: false });
       return;
     }
 
     io.to(peerSocketId).emit('peer-key', { keyBundle: publicKey, protocolVersion: 7 });
+    reply({ ok: true, relayed: true });
   });
 
   /**
    * KEY CONFIRMATION - Relay an encrypted proof that the sender derived the
    * same room-bound key. The relay cannot create or validate this proof.
    */
-  on('key-confirm', async (data) => {
+  on('key-confirm', async (data, ack) => {
+    const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const sessionId = socket.sessionId;
     const proof = data?.proof;
-    if (!sessionId || !socket.data.publicKey) return;
+    if (!sessionId) { reply({ ok: false, error: 'Session not found' }); return; }
+    if (!socket.data.publicKey) {
+      reply({ ok: false, error: 'Key exchange incomplete', retryable: true });
+      return;
+    }
     if (!isValidBase64(proof, MAX_KEY_CONFIRM_BASE64_CHARS)) {
       recordSecurityEvent('invalid-key-confirmation');
       socket.emit('error', { message: 'Invalid key confirmation payload.' });
+      reply({ ok: false, error: 'Invalid key confirmation payload.' });
       return;
     }
     if (!(await allowAction(socket, 'key-confirm', { limit: 4, sourceLimit: 12 }))) {
       socket.emit('rate-limited', { action: 'key-confirm', retryAfterMs: 60_000 });
+      reply({ ok: false, error: 'Rate limited' });
       return;
     }
 
     const roomData = await getRoomBySessionId(sessionId);
-    if (!roomData) return;
+    if (!roomData) { reply({ ok: false, error: 'Not in a chat' }); return; }
     const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
-    if (!peerSocketId) return;
+    if (!peerSocketId) { reply({ ok: false, error: 'Peer is unavailable', retryable: true }); return; }
 
     await setSessionKeyConfirmed(sessionId);
     socket.data.keyConfirmationSent = true;
     io.to(peerSocketId).emit('peer-key-confirm', { proof });
+    reply({ ok: true });
   });
 
   /**
