@@ -7,9 +7,13 @@ of the current service. See SECURITY_HARDENING.md in the repository root.
 Production requires NODE_ENV=production. For a same-host reverse proxy, set
 TRUST_PROXY=1 and TRUST_PROXY_CIDRS=127.0.0.1/32,::1/128. Use the actual proxy
 CIDRs for other topologies and restrict inbound Node access to those proxies.
-The proxy must overwrite forwarding headers. Set ALLOW_UNVERIFIED_CHATS=false
-to retain the default invite-only mode. Upgrade the backend and app together
-for protocol 7; older clients are rejected. New native app builds are required.
+The proxy must overwrite forwarding headers. Random one-to-one chat is enabled;
+public groups remain disabled. ALLOW_UNVERIFIED_CHATS is obsolete.
+Deploy the Phase 4X backend (commit 544d1db or a descendant) and restart its Node
+process together with updating the app. Updating local files does not update the
+running server. Earlier protocol-7 backends use incompatible longer invites and
+disable random chat; the protocol number alone does not establish compatibility.
+New native app builds are required for native changes.
 
 These are preparation files, not a deployed or verified Tor service.
 

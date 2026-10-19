@@ -30,3 +30,23 @@ test('queue cannot match a session with itself and deletes room records on end',
  assert.equal(mm.joinQueue('one', 's1'), null); mm.destroyRoom(result.roomId); assert.equal(mm.getRoom(result.roomId), undefined);
  removeSession('one'); removeSession('two');
 });
+
+test('private code creation and formatted joining work with the obsolete flag false', async () => {
+ const server = await startServer({ ALLOW_UNVERIFIED_CHATS: 'false' });
+ const sockets = [];
+ try {
+  const connect = async () => {
+   const socket = io(server.url, { transports: ['websocket'], reconnection: false });
+   sockets.push(socket); await once(socket, 'joined'); return socket;
+  };
+  const creator = await connect(), joiner = await connect();
+  const invite = await ack(creator, 'create-invite');
+  assert.equal(invite.ok, true);
+  assert.match(invite.locator, /^[2-9A-HJKMNP-Z_]{6}$/);
+  const createdMatch = once(creator, 'matched'), joinedMatch = once(joiner, 'matched');
+  const formatted = invite.locator.slice(0, 3) + '-' + invite.locator.slice(3);
+  joiner.emit('join-invite', { locator: ' ' + formatted.toLowerCase() + ' ' });
+  const [a, b] = await Promise.all([createdMatch, joinedMatch]);
+  assert.ok(a.roomId); assert.equal(a.roomId, b.roomId);
+ } finally { for (const socket of sockets) socket.disconnect(); server.stop(); }
+});
