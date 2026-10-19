@@ -1,3 +1,11 @@
+## Phase 4X join-code update
+Six-character codes are short-lived lookup IDs, not secrets or authentication keys.
+The old 256-bit invite-secret design below is superseded for new chats. Clients use
+libsignal and must compare safety codes through a trusted channel to authenticate
+peers. Relay misdirection is possible without that comparison. Limits: 5/connection,
+10/IP (IPv6 /64), 1000 global attempts per minute; all attempts count, including
+malformed requests. INVITE_TTL_MS defaults to 600000. Codes are single-use and never logged.
+
 # Security policy
 
 ## Reporting

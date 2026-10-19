@@ -26,7 +26,7 @@ const {
   destroyRoom,
 } = require('./matchmaking');
 const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite, getInviteForRequest } = require('./invites');
-const { isValidInviteLocator } = require('./inviteRateLimiter');
+const { isValidInviteLocator, normalizeInviteLocator } = require('./inviteRateLimiter');
 const { isValidMessageId, isValidKeyBundle, isValidBase64 } = require('./validation');
 const { allowAction } = require('./abuseLimiter');
 const { recordSecurityEvent } = require('./securityMonitor');
@@ -332,8 +332,12 @@ function registerHandlers(io, socket) {
    * JOIN INVITE - Redeem an invite code and start a chat.
    */
   on('join-invite', async (data) => {
+    if (!(await allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10, globalLimit: 1000, windowMs: 60000 }))) {
+      socket.emit('error', { message: 'Too many attempts. Wait a minute and try again.' });
+      return;
+    }
     const locator = typeof data?.locator === 'string' && data.locator.length <= 64
-      ? data.locator.toUpperCase().trim() : null;
+      ? normalizeInviteLocator(data.locator) : null;
     const sessionId = socket.sessionId;
 
     const session = sessionId ? await getSession(sessionId) : null;
@@ -362,10 +366,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10 }))) {
-      socket.emit('error', { message: 'Too many attempts. Wait a minute and try again.' });
-      return;
-    }
+
 
     const invite = await getInvite(locator);
     if (!invite) {

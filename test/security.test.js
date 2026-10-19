@@ -100,11 +100,11 @@ test('message identifiers and aggregate monitoring reject identifying fields', (
   assert.deepEqual(takeSecuritySnapshot(), { 'invalid-encrypted-payload': 1 });
 });
 
-test('invite locators are single-consumer while the authentication secret stays client-side', async () => {
+test('short lookup locators are single-consumer', async () => {
   const sessionId = '10000000-0000-4000-8000-000000000001';
   const locator = await createInvite(sessionId, 'socket-unit');
   assert.equal(isValidInviteLocator(locator), true);
-  assert.match(locator, /^TALK-(?:[2-9A-HJ-NP-Z]{4}-){3}[2-9A-HJ-NP-Z]{4}$/);
+  assert.match(locator, /^[2-9A-HJKMNP-Z_]{6}$/);
   assert.equal((await getInvite(locator)).sessionId, sessionId);
   assert.equal((await consumeInvite(locator, sessionId)).sessionId, sessionId);
   assert.equal(await consumeInvite(locator, sessionId), null);

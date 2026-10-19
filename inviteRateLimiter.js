@@ -1,7 +1,8 @@
-/** Server-visible format: 80-bit locator; a separate 256-bit secret stays client-side. */
-function isValidInviteLocator(locator) {
-  return typeof locator === 'string' &&
-    /^TALK-[2-9A-HJ-NP-Z]{4}(?:-[2-9A-HJ-NP-Z]{4}){3}$/.test(locator.toUpperCase().trim());
+/** Six-character lookup IDs have no cryptographic authentication role. */
+function normalizeInviteLocator(value) {
+  if (typeof value !== 'string' || value.length > 32) return null;
+  const code = value.toUpperCase().replace(/[-\s]/g, '');
+  return /^[2-9A-HJKMNP-Z_]{6}$/.test(code) ? code : null;
 }
-
-module.exports = { isValidInviteLocator };
+function isValidInviteLocator(value) { return normalizeInviteLocator(value) !== null; }
+module.exports = { isValidInviteLocator, normalizeInviteLocator };
