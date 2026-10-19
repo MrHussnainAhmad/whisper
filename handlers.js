@@ -28,7 +28,7 @@ const {
 const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite, getInviteForRequest } = require('./invites');
 const { isValidInviteLocator, normalizeInviteLocator } = require('./inviteRateLimiter');
 const { isValidMessageId, isValidKeyBundle, isValidBase64 } = require('./validation');
-const { allowAction } = require('./abuseLimiter');
+const { allowAction, MAX_CONNECTIONS_GLOBAL } = require('./abuseLimiter');
 const { recordSecurityEvent } = require('./securityMonitor');
 const {
   createCaptcha,
@@ -49,6 +49,21 @@ const MAX_ENCRYPTED_BASE64_CHARS = Math.ceil(MAX_ENCRYPTED_BYTES / 3) * 4;
 const MAX_KEY_CONFIRM_BASE64_CHARS = 16384;
 const ALLOW_UNVERIFIED_CHATS = false; // Public group chat remains disabled.
 
+// Process-wide budgets scale with the connection cap (tuned at 5000 sockets).
+const CAPACITY_SCALE = MAX_CONNECTIONS_GLOBAL / 5000;
+const scaledLimit = (base) => Math.max(1, Math.round(base * CAPACITY_SCALE));
+const GLOBAL_EVENTS_PER_SECOND = scaledLimit(10000);
+const GLOBAL_MESSAGES_PER_SECOND = scaledLimit(4000);
+const GLOBAL_MESSAGE_BYTES_PER_SECOND = scaledLimit(64 * 1024 * 1024);
+const GLOBAL_INVITE_JOINS_PER_MINUTE = scaledLimit(1000);
+
+let groupStatusIo = null;
+function ensureGroupStatusListener(io) {
+  if (groupStatusIo === io) return;
+  groupStatusIo = io;
+  setGroupStatusListener((status) => io.emit('group-status', status));
+}
+
 function estimateBase64Bytes(b64) {
   if (!b64) return 0;
   const len = b64.length;
@@ -60,9 +75,9 @@ function estimateBase64Bytes(b64) {
  * Register all event handlers for a new socket connection.
  */
 function registerHandlers(io, socket) {
-  setGroupStatusListener((status) => io.emit('group-status', status));
+  ensureGroupStatusListener(io);
   socket.use((_packet, next) => {
-    allowAction(socket, 'all-events', { limit: 100, sourceLimit: 200, globalLimit: 10000, windowMs: 1000 })
+    allowAction(socket, 'all-events', { limit: 100, sourceLimit: 200, globalLimit: GLOBAL_EVENTS_PER_SECOND, windowMs: 1000 })
       .then((allowed) => { if (allowed) next(); else socket.disconnect(true); })
       .catch(() => socket.disconnect(true));
   });
@@ -337,7 +352,7 @@ function registerHandlers(io, socket) {
    * JOIN INVITE - Redeem an invite code and start a chat.
    */
   on('join-invite', async (data) => {
-    if (!(await allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10, globalLimit: 1000, windowMs: 60000 }))) {
+    if (!(await allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10, globalLimit: GLOBAL_INVITE_JOINS_PER_MINUTE, windowMs: 60000 }))) {
       socket.emit('error', { message: 'Too many attempts. Wait a minute and try again.' });
       return;
     }
@@ -568,7 +583,7 @@ function registerHandlers(io, socket) {
     }
 
     // Includes encrypted receipts, typing, privacy policy and liveness traffic.
-    if (!(await allowAction(socket, 'message-count', { limit: 40, sourceLimit: 80, globalLimit: 4000, windowMs: 1000 }))) {
+    if (!(await allowAction(socket, 'message-count', { limit: 40, sourceLimit: 80, globalLimit: GLOBAL_MESSAGES_PER_SECOND, windowMs: 1000 }))) {
       reply({ ok: false, error: 'Too many messages. Please slow down.', retryable: true });
       return;
     }
@@ -576,7 +591,7 @@ function registerHandlers(io, socket) {
     if (!(await allowAction(socket, 'message-bytes', {
       limit: 8 * 1024 * 1024,
       sourceLimit: 16 * 1024 * 1024,
-      globalLimit: 64 * 1024 * 1024,
+      globalLimit: GLOBAL_MESSAGE_BYTES_PER_SECOND,
       windowMs: 1000,
       cost: Math.max(1, encryptedBytes),
     }))) {
@@ -611,8 +626,11 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Peer disconnected' });
       return;
     }
-    const bufferedBytes = (peer.conn.writeBuffer || []).reduce((total, packet) =>
-      total + (typeof packet.data === 'string' ? Buffer.byteLength(packet.data) : packet.data?.byteLength || 0), 0);
+    // Relay packets are ASCII JSON, so string length equals byte length.
+    let bufferedBytes = 0;
+    for (const packet of peer.conn.writeBuffer || []) {
+      bufferedBytes += typeof packet.data === 'string' ? packet.data.length : packet.data?.byteLength || 0;
+    }
     if (bufferedBytes + encrypted.length > 2 * 1024 * 1024) {
       reply({ ok: false, error: 'Peer connection is busy', retryable: true });
       return;
@@ -625,7 +643,7 @@ function registerHandlers(io, socket) {
     if (recentMessageIds.size > 200) {
       recentMessageIds.delete(recentMessageIds.values().next().value);
     }
-    io.to(peerSocketId).emit('receive-encrypted', { encrypted, messageId });
+    peer.emit('receive-encrypted', { encrypted, messageId });
     reply({ ok: true, messageId, duplicate: false });
   });
 

@@ -35,6 +35,11 @@ const { cancelInvite } = require('./invites');
 
 const PORT = process.env.PORT || 3000;
 const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
+const LISTEN_BACKLOG = (() => {
+  const value = Number(process.env.LISTEN_BACKLOG || 2048);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error('LISTEN_BACKLOG must be a positive integer');
+  return value;
+})();
 
 // --- HTTP Server ---
 const server = http.createServer(app);
@@ -57,6 +62,9 @@ const io = new Server(server, {
   pingTimeout: 30000,
   pingInterval: 25000,
   connectTimeout: 10_000,
+  // Ciphertext does not compress; deflate would only burn CPU and per-socket RAM.
+  perMessageDeflate: false,
+  httpCompression: false,
 });
 
 // Engine.IO bypasses Express routes. Apply transport checks to polling and
@@ -120,8 +128,11 @@ io.use(async (socket, next) => {
 /**
  * On each new WebSocket connection, register all event handlers.
  */
+const LOG_CONNECTIONS = process.env.NODE_ENV !== 'production';
+
 io.on('connection', async (socket) => {
-  console.log('Device connected');
+  // Per-connection stdout writes are synchronous on many hosts; skip them in production.
+  if (LOG_CONNECTIONS) console.log('Device connected');
 
   let released = false;
   socket.on('disconnect', () => {
@@ -152,7 +163,7 @@ io.on('connection', async (socket) => {
 async function start() {
   startSecurityMonitoring();
 
-  server.listen(PORT, BIND_HOST, () => {
+  server.listen(PORT, BIND_HOST, LISTEN_BACKLOG, () => {
     console.log(`Anonymous Chat Backend running on port ${PORT}`);
     console.log('Privacy mode: temporary state in this process RAM only; no external state service.');
     if (ENFORCE_HTTPS) {

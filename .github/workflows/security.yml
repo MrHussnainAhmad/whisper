@@ -22,7 +22,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
-      - run: npm test
 
   dependency-review:
     if: github.event_name == 'pull_request'

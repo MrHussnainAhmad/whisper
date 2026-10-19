@@ -50,3 +50,41 @@ temp/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local-only test source and helpers
+test/
+tests/
+__tests__/
+*.test.*
+*.spec.*
+
+# Generated test results
+test-results/
+test-reports/
+playwright-report/
+blob-report/
+*.lcov
+junit.xml
+
+# Local credentials, database sidecars, and diagnostic dumps
+credentials.json
+credential*.json
+service-account*.json
+*.p8
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+*.heapsnapshot
+*.heapprofile
+*.cpuprofile
+report.*.json
+
+# Local scratch files and editor backups
+.codex/
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~

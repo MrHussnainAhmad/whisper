@@ -12,32 +12,114 @@ const {
   claimSessionRooms,
 } = require('./sessions');
 
-// In-memory store
-const waitingQueue = [];
+const QUEUE_ENTRY_TTL_MS = 120000;
+const BLOCK_TTL_MS = 1800000;
+const MAX_BLOCKED_PAIRS = (() => {
+  const value = Number(process.env.MAX_BLOCKED_PAIRS || 50000);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error('MAX_BLOCKED_PAIRS must be a positive integer');
+  return value;
+})();
+
+// In-memory store. Map preserves insertion order, so iteration is FIFO.
+const waitingQueue = new Map();
 const rooms = new Map();
+const sessionRooms = new Map();
+
+const blockedPairs = new Map();
+const blocksById = new Map();
+const pairKey = (a, b) => (a < b ? `${a}:${b}` : `${b}:${a}`);
+
+function indexBlock(id, key) {
+  let keys = blocksById.get(id);
+  if (!keys) { keys = new Set(); blocksById.set(id, keys); }
+  keys.add(key);
+}
+
+function deleteBlock(key) {
+  const entry = blockedPairs.get(key);
+  if (!entry) return;
+  blockedPairs.delete(key);
+  for (const id of [entry.a, entry.b]) {
+    const keys = blocksById.get(id);
+    keys?.delete(key);
+    if (keys?.size === 0) blocksById.delete(id);
+  }
+}
+
+function pruneBlocks(now = Date.now()) {
+  for (const [key, entry] of blockedPairs) if (entry.until <= now) deleteBlock(key);
+}
+
+function blockPair(a, b) {
+  const key = pairKey(a, b);
+  deleteBlock(key);
+  if (blockedPairs.size >= MAX_BLOCKED_PAIRS) pruneBlocks();
+  // Entries share one TTL, so the oldest insertion is the next to expire.
+  while (blockedPairs.size >= MAX_BLOCKED_PAIRS) deleteBlock(blockedPairs.keys().next().value);
+  blockedPairs.set(key, { a, b, until: Date.now() + BLOCK_TTL_MS });
+  indexBlock(a, key);
+  indexBlock(b, key);
+}
+
+function isBlocked(a, b, now) {
+  const key = pairKey(a, b);
+  const entry = blockedPairs.get(key);
+  if (!entry) return false;
+  if (entry.until > now) return true;
+  deleteBlock(key);
+  return false;
+}
+
+function forgetBlocks(id) {
+  const keys = blocksById.get(id);
+  if (!keys) return;
+  for (const key of [...keys]) deleteBlock(key);
+}
+
+function isQueueEntryLive(item, now) {
+  const live = getSession(item.sessionId);
+  return !!live && !live.roomId && live.socketId === item.socketId &&
+    now - item.queuedAt < QUEUE_ENTRY_TTL_MS;
+}
+
+function pruneQueue(now = Date.now()) {
+  for (const [sessionId, item] of waitingQueue) {
+    if (!isQueueEntryLive(item, now)) waitingQueue.delete(sessionId);
+  }
+}
+
+const cleanupTimer = setInterval(() => {
+  const now = Date.now();
+  pruneBlocks(now);
+  pruneQueue(now);
+}, 60000);
+cleanupTimer.unref();
 
 /**
  * Add a user to the random matchmaking queue.
  * Returns a match object if two users are now waiting, otherwise null.
  */
-const blockedPairs = new Map();
-const pairKey = (a, b) => [a, b].sort().join(':');
-function blockPair(a, b) { if (blockedPairs.size >= 10000) throw new Error('Block capacity reached'); blockedPairs.set(pairKey(a, b), Date.now() + 1800000); }
-const blockCleanup = setInterval(() => { for (const [key, until] of blockedPairs) if (until <= Date.now()) blockedPairs.delete(key); }, 60000); blockCleanup.unref();
-function forgetBlocks(id) { for (const key of blockedPairs.keys()) if (key.split(':').includes(id)) blockedPairs.delete(key); }
 function joinQueue(sessionId, socketId, sourceKey = sessionId) {
   const now = Date.now();
-  for (const [key, until] of blockedPairs) if (until <= now) blockedPairs.delete(key);
   const session = getSession(sessionId);
   if (!session || session.socketId !== socketId || session.roomId) return null;
-  for (let i = waitingQueue.length - 1; i >= 0; i--) {
-    const item = waitingQueue[i], live = getSession(item.sessionId);
-    if (!live || live.roomId || live.socketId !== item.socketId || now - item.queuedAt >= 120000) waitingQueue.splice(i, 1);
+  const existing = waitingQueue.get(sessionId);
+  if (existing && isQueueEntryLive(existing, now)) return null;
+  waitingQueue.delete(sessionId);
+
+  let user1 = null;
+  for (const [waitingId, item] of waitingQueue) {
+    if (!isQueueEntryLive(item, now)) { waitingQueue.delete(waitingId); continue; }
+    if (isBlocked(item.sourceKey, sourceKey, now)) continue;
+    user1 = item;
+    break;
   }
-  if (waitingQueue.some(item => item.sessionId === sessionId)) return null;
-  const index = waitingQueue.findIndex(item => item.sessionId !== sessionId && !blockedPairs.has(pairKey(item.sourceKey, sourceKey)));
-  if (index < 0) { waitingQueue.push({ sessionId, socketId, sourceKey, queuedAt: now }); return null; }
-  const user1 = waitingQueue.splice(index, 1)[0], user2 = { sessionId, socketId, sourceKey };
+  if (!user1) {
+    waitingQueue.set(sessionId, { sessionId, socketId, sourceKey, queuedAt: now });
+    return null;
+  }
+  waitingQueue.delete(user1.sessionId);
+  const user2 = { sessionId, socketId, sourceKey };
   const roomId = crypto.randomUUID();
   if (!setRoomIfSessionsAvailable(roomId, { session1: user1, session2: user2 })) return null;
   return { roomId, user1, user2 };
@@ -47,19 +129,18 @@ function joinQueue(sessionId, socketId, sourceKey = sessionId) {
  * Remove a user from the waiting queue (e.g. cancelled search).
  */
 function leaveQueue(sessionId) {
-  const index = waitingQueue.findIndex((w) => w.sessionId === sessionId);
-  if (index !== -1) {
-    waitingQueue.splice(index, 1);
-    return true;
-  }
-  return false;
+  return waitingQueue.delete(sessionId);
 }
 
 /**
  * Check if a session is currently waiting in the queue.
  */
 function isInQueue(sessionId) {
-  return waitingQueue.some((w) => w.sessionId === sessionId);
+  const item = waitingQueue.get(sessionId);
+  if (!item) return false;
+  if (isQueueEntryLive(item, Date.now())) return true;
+  waitingQueue.delete(sessionId);
+  return false;
 }
 
 /**
@@ -74,15 +155,10 @@ function getRoom(roomId) {
  * Returns { roomId, room } or null.
  */
 function getRoomBySessionId(sessionId) {
-  for (const [roomId, room] of rooms) {
-    if (
-      room.session1.sessionId === sessionId ||
-      room.session2.sessionId === sessionId
-    ) {
-      return { roomId, room };
-    }
-  }
-  return null;
+  const roomId = sessionRooms.get(sessionId);
+  if (!roomId) return null;
+  const room = rooms.get(roomId);
+  return room ? { roomId, room } : null;
 }
 
 /**
@@ -115,6 +191,9 @@ function destroyRoom(roomId) {
   if (!room) return null;
 
   rooms.delete(roomId);
+  for (const { sessionId } of [room.session1, room.session2]) {
+    if (sessionRooms.get(sessionId) === roomId) sessionRooms.delete(sessionId);
+  }
   clearSessionRoom(room.session1.sessionId, roomId);
   clearSessionRoom(room.session2.sessionId, roomId);
   return room;
@@ -124,7 +203,7 @@ function destroyRoom(roomId) {
  * Get counts for health check.
  */
 function getQueueSize() {
-  return waitingQueue.length;
+  return waitingQueue.size;
 }
 
 function getRoomCount() {
@@ -160,6 +239,8 @@ function setRoomIfSessionsAvailable(roomId, room) {
   const claimed = claimSessionRooms(room.session1.sessionId, room.session2.sessionId, roomId);
   if (!claimed) return false;
   rooms.set(roomId, room);
+  sessionRooms.set(room.session1.sessionId, roomId);
+  sessionRooms.set(room.session2.sessionId, roomId);
   return true;
 }
 

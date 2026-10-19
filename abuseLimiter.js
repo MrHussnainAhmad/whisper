@@ -20,12 +20,17 @@ const globalConnections = new Set();
 // A process-local secret prevents offline enumeration of IPv4 limiter labels.
 const sourceSecret = crypto.randomBytes(32);
 
-const cleanupTimer = setInterval(() => {
-  const now = Date.now();
+const sourceKeyCache = new WeakMap();
+let lastFullSweepAt = 0;
+
+function sweepExpiredCounters(now) {
+  lastFullSweepAt = now;
   for (const [key, entry] of counters) {
     if (now >= entry.expiresAt) counters.delete(key);
   }
-}, 60_000);
+}
+
+const cleanupTimer = setInterval(() => sweepExpiredCounters(Date.now()), 15_000);
 cleanupTimer.unref();
 
 function normalizeSource(address) {
@@ -42,6 +47,17 @@ function normalizeSource(address) {
 }
 
 function getSourceKey(socket) {
+  const req = socket.request;
+  if (req && typeof req === 'object') {
+    const cached = sourceKeyCache.get(req);
+    if (cached) return cached;
+  }
+  const key = computeSourceKey(socket);
+  if (req && typeof req === 'object') sourceKeyCache.set(req, key);
+  return key;
+}
+
+function computeSourceKey(socket) {
   let address = socket.request?.socket?.remoteAddress || socket.handshake?.address || 'unknown';
   if (TRUST_PROXY_HOPS > 0 && socket.request) {
     try {
@@ -95,21 +111,38 @@ async function releaseConnection(socket) {
   return;
 }
 
+function consumeFrom(store, key, limit, windowMs, cost, now) {
+  let entry = store.get(key);
+  if (!entry) {
+    entry = { value: 0, expiresAt: now + windowMs };
+    store.set(key, entry);
+  } else if (now >= entry.expiresAt) {
+    entry.value = 0;
+    entry.expiresAt = now + windowMs;
+  }
+  if (entry.value + cost > limit) return false;
+  entry.value += cost;
+  return true;
+}
+
 function consumeMemory(bucket, identity, limit, windowMs, cost = 1) {
   if (!identity || !Number.isFinite(cost) || cost < 1) return false;
   const key = `${bucket}:${identity}`;
   const now = Date.now();
-  let entry = counters.get(key);
-  // Refuse new identities when full; do not evict live limits to admit abuse.
-  if (!entry && counters.size >= MAX_RATE_LIMIT_BUCKETS) return false;
-  if (!entry || now >= entry.expiresAt) entry = { value: 0, expiresAt: now + windowMs };
-  if (entry.value + cost > limit) {
-    counters.set(key, entry);
-    return false;
+  if (!counters.has(key) && counters.size >= MAX_RATE_LIMIT_BUCKETS) {
+    // Reclaim expired buckets (at most once per second) before refusing.
+    if (now - lastFullSweepAt >= 1000) sweepExpiredCounters(now);
+    // Refuse new identities when full; do not evict live limits to admit abuse.
+    if (counters.size >= MAX_RATE_LIMIT_BUCKETS) return false;
   }
-  entry.value += cost;
-  counters.set(key, entry);
-  return true;
+  return consumeFrom(counters, key, limit, windowMs, cost, now);
+}
+
+/** Per-session buckets live on the socket and are freed with it. */
+function consumeSession(socket, action, sessionId, limit, windowMs, cost) {
+  let store = socket.data.rateCounters;
+  if (!store) { store = new Map(); socket.data.rateCounters = store; }
+  return consumeFrom(store, `${action}:${sessionId}`, limit, windowMs, cost, Date.now());
 }
 
 async function allowAction(socket, action, options = {}) {
@@ -130,7 +163,7 @@ async function allowAction(socket, action, options = {}) {
     recordSecurityEvent('socket-rate-limited');
     return false;
   }
-  const allowed = consumeMemory(`${action}:session`, sessionId, limit, windowMs, cost);
+  const allowed = consumeSession(socket, action, sessionId, limit, windowMs, cost);
   if (!allowed) recordSecurityEvent('socket-rate-limited');
   return allowed;
 }
@@ -140,5 +173,6 @@ module.exports = {
   releaseConnection,
   allowAction,
   getSourceKey,
+  MAX_CONNECTIONS_GLOBAL,
   normalizeSource,
 };
