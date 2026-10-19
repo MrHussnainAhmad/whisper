@@ -6,8 +6,9 @@ const CLEANUP_INTERVAL_MS = 30 * 1000;
 const invites = new Map();
 const sessionInvites = new Map();
 const INVITE_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const { INVITE_LOCATOR_LENGTH } = require('./inviteRateLimiter');
 function generateInviteLocator() {
-  return Array.from({ length: 6 }, () => INVITE_ALPHABET[crypto.randomInt(INVITE_ALPHABET.length)]).join('');
+  return Array.from({ length: INVITE_LOCATOR_LENGTH }, () => INVITE_ALPHABET[crypto.randomInt(INVITE_ALPHABET.length)]).join('');
 }
 
 function storeInvite(locator, invite) {

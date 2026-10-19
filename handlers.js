@@ -753,10 +753,20 @@ function registerHandlers(io, socket) {
 
   /**
    * LEAVE ROOM - Voluntarily end the chat.
+   * Clears every chat-scoped record for this session. The session entry itself
+   * belongs to the still-open connection and is removed on disconnect.
    */
   on('leave-room', async (data, ack) => {
+    if (typeof data === 'function') ack = data;
+    queueEpoch++; clearTimeout(queueTimer);
+    const sessionId = socket.sessionId;
+    if (sessionId) {
+      leaveQueue(sessionId);
+      cancelInvite(sessionId);
+    }
     leaveGroupIfNeeded();
     await handleDisconnectFromRoom(io, socket);
+    await resetChatState();
     if (typeof ack === 'function') ack({ ok: true });
   });
 
