@@ -38,7 +38,7 @@ test('forwarding headers only work when the immediate peer is explicitly trusted
   }
 });
 
-test('default server rejects random and public group entry', async () => {
+test('default server enables one-to-one search and rejects groups', async () => {
   const server = await startServer();
   const socket = io(server.url, { transports: ['websocket'], reconnection: false });
   try {
@@ -46,11 +46,12 @@ test('default server rejects random and public group entry', async () => {
       const timer = setTimeout(() => reject(new Error('Session timed out')), 5000);
       socket.once('joined', () => { clearTimeout(timer); resolve(); });
     });
-    for (const event of ['find-random', 'group-captcha', 'join-group']) {
+    for (const event of ['group-captcha', 'join-group']) {
       const response = await socket.timeout(3000).emitWithAck(event, {});
       assert.equal(response.ok, false);
       assert.match(response.error, /disabled/);
     }
     assert.equal((await socket.timeout(3000).emitWithAck('create-invite', {})).ok, true);
+    assert.equal((await socket.timeout(3000).emitWithAck('find-random', {})).status, 'waiting');
   } finally { socket.disconnect(); server.stop(); }
 });

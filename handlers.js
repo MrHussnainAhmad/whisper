@@ -18,7 +18,7 @@ const {
   clearSessionPublicKey,
 } = require('./sessions');
 const {
-  joinQueue,
+  joinQueue, blockPair, forgetBlocks,
   leaveQueue,
   isInQueue,
   getRoomBySessionId,
@@ -47,7 +47,7 @@ const {
 const MAX_ENCRYPTED_BYTES = 192 * 1024;
 const MAX_ENCRYPTED_BASE64_CHARS = Math.ceil(MAX_ENCRYPTED_BYTES / 3) * 4;
 const MAX_KEY_CONFIRM_BASE64_CHARS = 16384;
-const ALLOW_UNVERIFIED_CHATS = process.env.ALLOW_UNVERIFIED_CHATS === 'true';
+const ALLOW_UNVERIFIED_CHATS = false; // Public group chat remains disabled.
 
 function estimateBase64Bytes(b64) {
   if (!b64) return 0;
@@ -67,6 +67,7 @@ function registerHandlers(io, socket) {
       .catch(() => socket.disconnect(true));
   });
 
+  let queueEpoch = 0, queueTimer;
   let pendingHandlers = 0;
   const on = (event, handler) => {
     socket.on(event, (...args) => {
@@ -118,11 +119,8 @@ function registerHandlers(io, socket) {
   on('find-random', async (data, ack) => {
     if (typeof data === 'function') ack = data;
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
-    if (!ALLOW_UNVERIFIED_CHATS) {
-      reply({ ok: false, error: 'Use a private invite. Random chat is disabled.' });
-      socket.emit('error', { message: 'Use a private invite. Random chat is disabled.' });
-      return;
-    }
+    const searchEpoch = ++queueEpoch;
+    clearTimeout(queueTimer);
     const sessionId = socket.sessionId;
     const session = sessionId ? await getSession(sessionId) : null;
     if (!sessionId || !session) {
@@ -149,7 +147,8 @@ function registerHandlers(io, socket) {
       await cancelInvite(sessionId);
     }
 
-    const match = await joinQueue(sessionId, socket.id);
+    if (searchEpoch !== queueEpoch || !socket.connected) { reply({ ok: false, error: 'Search cancelled' }); return; }
+    const match = joinQueue(sessionId, socket.id, socket.data.sourceKey);
 
     if (match) {
       const { roomId, user1, user2 } = match;
@@ -157,6 +156,11 @@ function registerHandlers(io, socket) {
       io.to(user2.socketId).emit('matched', { roomId });
       reply({ ok: true, status: 'matched', roomId });
     } else {
+      queueTimer = setTimeout(() => {
+        if (searchEpoch === queueEpoch && isInQueue(sessionId)) {
+          leaveQueue(sessionId); socket.emit('search-timeout', { message: 'No match found. Try again.' });
+        }
+      }, Number(process.env.MATCH_WAIT_MS || 120000)); queueTimer.unref();
       socket.emit('waiting', { message: 'Looking for someone online...' });
       reply({ ok: true, status: 'waiting' });
     }
@@ -166,6 +170,7 @@ function registerHandlers(io, socket) {
    * CANCEL SEARCH - Leave the matchmaking queue.
    */
   on('cancel-search', async () => {
+    queueEpoch++; clearTimeout(queueTimer);
     const sessionId = socket.sessionId;
     if (!sessionId) return;
     await leaveQueue(sessionId);
@@ -669,7 +674,18 @@ function registerHandlers(io, socket) {
   /**
    * REPORT - Report a user. Both users are disconnected and the room is destroyed.
    */
-  on('report', async () => {
+  on('block-peer', async (_data, ack) => {
+    if (!(await allowAction(socket, 'block-peer', { limit: 10, sourceLimit: 20 }))) { ack?.({ ok: false, error: 'Too many requests' }); return; }
+    const current = getRoomBySessionId(socket.sessionId);
+    if (!current) { ack?.({ ok: false, error: 'Chat ended' }); return; }
+    const peer = current.room.session1.sessionId === socket.sessionId ? current.room.session2 : current.room.session1;
+    blockPair(socket.data.sourceKey, io.sockets.sockets.get(peer.socketId)?.data.sourceKey || peer.sessionId);
+    destroyRoom(current.roomId);
+    io.to(peer.socketId).emit('chat-ended', { reasonCode: 'peer_left' });
+    ack?.({ ok: true });
+  });
+  on('report', async (data, ack) => {
+    if (!['spam', 'abuse', 'other'].includes(data?.category)) { if (typeof ack === 'function') ack({ ok: false }); return; }
     const sessionId = socket.sessionId;
     if (!sessionId) {
       socket.emit('error', { message: 'Session not found' });
@@ -689,11 +705,15 @@ function registerHandlers(io, socket) {
     }
 
     const { roomId } = roomData;
+    const other = roomData.room.session1.sessionId === sessionId ? roomData.room.session2 : roomData.room.session1;
+    blockPair(socket.data.sourceKey, io.sockets.sockets.get(other.socketId)?.data.sourceKey || other.sessionId);
+    recordSecurityEvent('report-' + data.category);
     const peerSocketId = await getPeerSocketId(roomId, sessionId, roomData.room);
     socket.emit('chat-ended', { reasonCode: 'reported' });
     if (peerSocketId) io.to(peerSocketId).emit('chat-ended', { reasonCode: 'reported' });
 
     await destroyRoom(roomId);
+    if (typeof ack === 'function') ack({ ok: true });
   });
 
   /**
@@ -709,6 +729,7 @@ function registerHandlers(io, socket) {
    * DISCONNECT - Socket disconnected (app closed, network lost, etc.).
    */
   on('disconnect', async () => {
+    queueEpoch++; clearTimeout(queueTimer); forgetBlocks(socket.sessionId);
     const sessionId = socket.sessionId;
     if (!sessionId) return;
 

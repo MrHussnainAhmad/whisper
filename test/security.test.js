@@ -287,73 +287,9 @@ test('random matchmaking always acknowledges the resulting UI state', async () =
   }
 });
 
-test('global group chat uses temporary unique usernames and retains no history', async () => {
-  const first = await connectClient();
-  const second = await connectClient();
-  const third = await connectClient();
-  try {
-    const firstCaptcha = (await emitAck(first, 'group-captcha')).captcha;
-    assert.equal(firstCaptcha.refreshEveryMs, 15_000);
-    assert.equal(firstCaptcha.questions.length, 8);
-    const firstJoin = await emitAck(first, 'join-group', {
-      username: 'Alice',
-      captchaId: firstCaptcha.id,
-      captchaAnswer: solveCaptcha(firstCaptcha),
-      powSolution: solveProofOfWork(firstCaptcha),
-    });
-    assert.equal(firstJoin.ok, true);
-    assert.equal(firstJoin.username, 'Alice');
-    assert.equal(firstJoin.messageTtlMs, 90_000);
-    assert.deepEqual(firstJoin.users, ['Alice']);
-
-    const duplicateCaptcha = (await emitAck(second, 'group-captcha')).captcha;
-    const duplicateJoin = await emitAck(second, 'join-group', {
-      username: 'alice',
-      captchaId: duplicateCaptcha.id,
-      captchaAnswer: solveCaptcha(duplicateCaptcha),
-      powSolution: solveProofOfWork(duplicateCaptcha),
-    });
-    assert.equal(duplicateJoin.ok, false);
-    assert.match(duplicateJoin.error, /already/i);
-
-    const secondCaptcha = (await emitAck(second, 'group-captcha')).captcha;
-    const secondJoin = await emitAck(second, 'join-group', {
-      username: 'Bob',
-      captchaId: secondCaptcha.id,
-      captchaIndex: 1,
-      captchaAnswer: solveCaptcha({ question: secondCaptcha.questions[1] }),
-      powSolution: solveProofOfWork(secondCaptcha),
-    });
-    assert.equal(secondJoin.ok, true);
-    assert.equal(secondJoin.activeUsers, 2);
-    assert.deepEqual(secondJoin.users, ['Alice', 'Bob']);
-
-    const groupStatus = await emitAck(first, 'group-status', {});
-    assert.deepEqual(groupStatus, { ok: true, activeUsers: 2, isActive: true });
-
-    const sent = await emitAck(first, 'group-message', { text: 'hello @Bob' });
-    assert.equal(sent.ok, true);
-    assert.equal(sent.message.username, 'Alice');
-    assert.deepEqual(sent.message.mentions, ['Bob']);
-    assert.equal(sent.message.private, true);
-
-    await emitAck(first, 'leave-group');
-    const thirdCaptcha = (await emitAck(third, 'group-captcha')).captcha;
-    const thirdJoin = await emitAck(third, 'join-group', {
-      username: 'Alice',
-      captchaId: thirdCaptcha.id,
-      captchaAnswer: solveCaptcha(thirdCaptcha),
-      powSolution: solveProofOfWork(thirdCaptcha),
-    });
-    assert.equal(thirdJoin.ok, true);
-    assert.equal(thirdJoin.username, 'Alice');
-    assert.equal(thirdJoin.messages.some((message) => message.text === 'hello @Bob'), false);
-  } finally {
-    first.emit('leave-group');
-    second.emit('leave-group');
-    third.emit('leave-group');
-    first.disconnect();
-    second.disconnect();
-    third.disconnect();
-  }
+test('public groups stay disabled even with the obsolete environment flag', async () => {
+  const client = await connectClient();
+  try { for (const event of ['group-captcha', 'join-group']) {
+    const result = await emitAck(client, event, {}); assert.equal(result.ok, false); assert.match(result.error, /disabled/);
+  }} finally { client.disconnect(); }
 });

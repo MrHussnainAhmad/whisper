@@ -20,47 +20,27 @@ const rooms = new Map();
  * Add a user to the random matchmaking queue.
  * Returns a match object if two users are now waiting, otherwise null.
  */
-function joinQueue(sessionId, socketId) {
-  const alreadyInQueue = waitingQueue.some((w) => w.sessionId === sessionId);
-  if (alreadyInQueue) return null;
-
-  waitingQueue.push({ sessionId, socketId });
-
-  const popValid = () => {
-    while (waitingQueue.length) {
-      const entry = waitingQueue.shift();
-      const session = getSession(entry.sessionId);
-      if (session && session.socketId === entry.socketId && !session.roomId) {
-        return entry;
-      }
-    }
-    return null;
-  };
-
-  const user1 = popValid();
-  const user2 = popValid();
-
-  if (user1 && user2) {
-    const roomId = crypto.randomUUID();
-    const room = { session1: user1, session2: user2 };
-    if (setRoomIfSessionsAvailable(roomId, room)) {
-      return { roomId, user1, user2 };
-    }
-
-    for (const entry of [user1, user2]) {
-      const candidate = getSession(entry.sessionId);
-      if (candidate && candidate.socketId === entry.socketId && !candidate.roomId) {
-        waitingQueue.push(entry);
-      }
-    }
-    return null;
+const blockedPairs = new Map();
+const pairKey = (a, b) => [a, b].sort().join(':');
+function blockPair(a, b) { if (blockedPairs.size >= 10000) throw new Error('Block capacity reached'); blockedPairs.set(pairKey(a, b), Date.now() + 1800000); }
+const blockCleanup = setInterval(() => { for (const [key, until] of blockedPairs) if (until <= Date.now()) blockedPairs.delete(key); }, 60000); blockCleanup.unref();
+function forgetBlocks(id) { for (const key of blockedPairs.keys()) if (key.split(':').includes(id)) blockedPairs.delete(key); }
+function joinQueue(sessionId, socketId, sourceKey = sessionId) {
+  const now = Date.now();
+  for (const [key, until] of blockedPairs) if (until <= now) blockedPairs.delete(key);
+  const session = getSession(sessionId);
+  if (!session || session.socketId !== socketId || session.roomId) return null;
+  for (let i = waitingQueue.length - 1; i >= 0; i--) {
+    const item = waitingQueue[i], live = getSession(item.sessionId);
+    if (!live || live.roomId || live.socketId !== item.socketId || now - item.queuedAt >= 120000) waitingQueue.splice(i, 1);
   }
-
-  if (user1 && !user2) {
-    waitingQueue.unshift(user1);
-  }
-
-  return null;
+  if (waitingQueue.some(item => item.sessionId === sessionId)) return null;
+  const index = waitingQueue.findIndex(item => item.sessionId !== sessionId && !blockedPairs.has(pairKey(item.sourceKey, sourceKey)));
+  if (index < 0) { waitingQueue.push({ sessionId, socketId, sourceKey, queuedAt: now }); return null; }
+  const user1 = waitingQueue.splice(index, 1)[0], user2 = { sessionId, socketId, sourceKey };
+  const roomId = crypto.randomUUID();
+  if (!setRoomIfSessionsAvailable(roomId, { session1: user1, session2: user2 })) return null;
+  return { roomId, user1, user2 };
 }
 
 /**
@@ -184,7 +164,7 @@ function setRoomIfSessionsAvailable(roomId, room) {
 }
 
 module.exports = {
-  joinQueue,
+  blockPair, forgetBlocks, joinQueue,
   leaveQueue,
   isInQueue,
   getRoom,

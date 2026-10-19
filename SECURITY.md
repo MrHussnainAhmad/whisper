@@ -1,3 +1,14 @@
+## Phase 4X random one-to-one
+Random matching is enabled with libsignal encryption and an unverified-peer safety
+fingerprint. Public groups are hard-disabled even if the obsolete environment flag
+is set. A malicious relay can misdirect pairing without trusted fingerprint comparison.
+Queue: 2-minute timeout, 10 entries/connection and 20/network source per minute.
+Block/Skip/Report: pair of process-secret HMAC source labels, bounded to 10000,
+expires in 30 minutes with a 1-minute sweep. Shared-network collateral is possible;
+changing network can evade this anonymous block. Only explicit report categories
+are counted; no messages/files are submitted or retained. Session/room state and
+cache cleanup remain ephemeral; vault is separate. See mobile PRIVACY_POLICY.md.
+
 ## Phase 4X join-code update
 Six-character codes are short-lived lookup IDs, not secrets or authentication keys.
 The old 256-bit invite-secret design below is superseded for new chats. Clients use
