@@ -5,10 +5,12 @@ const invites = require('../invites');
 const { normalizeInviteLocator } = require('../inviteRateLimiter');
 const { allowAction } = require('../abuseLimiter');
 test('lookup alphabet, normalization, expiry, collision retry and one use', t => {
-  for (let i = 0; i < 100; i++) assert.match(invites.generateInviteLocator(), /^[2-9A-HJKMNP-Z_]{6}$/);
+  for (let i = 0; i < 100; i++) assert.match(invites.generateInviteLocator(), /^[0-9A-Z]{6}$/);
   assert.equal(normalizeInviteLocator('ab c-d ef'), 'ABCDEF');
+  for (const char of '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ') assert.equal(normalizeInviteLocator(char.repeat(6)), char.repeat(6));
+  assert.equal(normalizeInviteLocator('ABC_EF'), null);
   assert.equal(normalizeInviteLocator('TALK-AAAA-AAAA-AAAA-AAAA'), null);
-  t.mock.method(crypto, 'randomBytes', n => Buffer.alloc(n, 0));
+  t.mock.method(crypto, 'randomInt', () => 0);
   const code = invites.createInvite('first', 'socket');
   assert.throws(() => invites.createInvite('second', 'socket2'), /allocate/);
   t.mock.restoreAll();
@@ -17,6 +19,14 @@ test('lookup alphabet, normalization, expiry, collision retry and one use', t =>
   const now = Date.now(); t.mock.method(Date, 'now', () => now + invites.INVITE_TTL_MS);
   assert.equal(invites.getInvite(code), null); t.mock.restoreAll();
   assert.ok(invites.consumeInvite(second, 'second')); assert.equal(invites.consumeInvite(second, 'second'), null);
+});
+test('all 36 alphabet symbols are reachable through bounded cryptographic randomInt', t => {
+  const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  for (let index = 0; index < alphabet.length; index++) {
+    t.mock.method(crypto, 'randomInt', max => { assert.equal(max, 36); return index; });
+    assert.equal(invites.generateInviteLocator(), alphabet[index].repeat(6));
+    t.mock.restoreAll();
+  }
 });
 test('connection, source and global attempt caps lock out until window expires', async t => {
   const socket = { sessionId: 'a', data: { sourceKey: 'ip-a' } };

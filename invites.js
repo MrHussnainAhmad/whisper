@@ -3,9 +3,9 @@ const INVITE_TTL_MS = Number(process.env.INVITE_TTL_MS || 600000);
 if (!Number.isSafeInteger(INVITE_TTL_MS) || INVITE_TTL_MS < 1000 || INVITE_TTL_MS > 3600000) throw new Error('Invalid INVITE_TTL_MS');
 const CLEANUP_INTERVAL_MS = 30 * 1000;
 const invites = new Map();
-const INVITE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ_';
+const INVITE_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 function generateInviteLocator() {
-  return [...require('crypto').randomBytes(6)].map(byte => INVITE_ALPHABET[byte & 31]).join('');
+  return Array.from({ length: 6 }, () => INVITE_ALPHABET[require('crypto').randomInt(INVITE_ALPHABET.length)]).join('');
 }
 
 function createInvite(sessionId, socketId, requestId = null) {

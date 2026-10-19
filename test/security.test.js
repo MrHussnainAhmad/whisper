@@ -104,7 +104,7 @@ test('short lookup locators are single-consumer', async () => {
   const sessionId = '10000000-0000-4000-8000-000000000001';
   const locator = await createInvite(sessionId, 'socket-unit');
   assert.equal(isValidInviteLocator(locator), true);
-  assert.match(locator, /^[2-9A-HJKMNP-Z_]{6}$/);
+  assert.match(locator, /^[0-9A-Z]{6}$/);
   assert.equal((await getInvite(locator)).sessionId, sessionId);
   assert.equal((await consumeInvite(locator, sessionId)).sessionId, sessionId);
   assert.equal(await consumeInvite(locator, sessionId), null);

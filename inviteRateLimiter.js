@@ -2,7 +2,7 @@
 function normalizeInviteLocator(value) {
   if (typeof value !== 'string' || value.length > 32) return null;
   const code = value.toUpperCase().replace(/[-\s]/g, '');
-  return /^[2-9A-HJKMNP-Z_]{6}$/.test(code) ? code : null;
+  return /^[0-9A-Z]{6}$/.test(code) ? code : null;
 }
 function isValidInviteLocator(value) { return normalizeInviteLocator(value) !== null; }
 module.exports = { isValidInviteLocator, normalizeInviteLocator };

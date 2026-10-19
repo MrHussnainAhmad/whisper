@@ -42,7 +42,7 @@ test('private code creation and formatted joining work with the obsolete flag fa
   const creator = await connect(), joiner = await connect();
   const invite = await ack(creator, 'create-invite');
   assert.equal(invite.ok, true);
-  assert.match(invite.locator, /^[2-9A-HJKMNP-Z_]{6}$/);
+  assert.match(invite.locator, /^[0-9A-Z]{6}$/);
   const createdMatch = once(creator, 'matched'), joinedMatch = once(joiner, 'matched');
   const formatted = invite.locator.slice(0, 3) + '-' + invite.locator.slice(3);
   joiner.emit('join-invite', { locator: ' ' + formatted.toLowerCase() + ' ' });
