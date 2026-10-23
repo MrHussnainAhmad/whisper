@@ -29,6 +29,7 @@ function addSession(sessionId, socketId) {
  * Removes the store entry; this is not a forensic memory-erasure guarantee.
  */
 function removeSession(sessionId) {
+  require('./matchmaking').forgetBlocks(sessionId);
   sessions.delete(sessionId);
   return;
 }
@@ -58,6 +59,7 @@ function clearSessionRoom(sessionId, expectedRoomId) {
     session.roomId = null;
     session.publicKey = null;
     session.keyConfirmed = false;
+    session.recentMessageIds = null;
   }
   return;
 }
@@ -128,7 +130,7 @@ async function cleanupExpiredSessions() {
   for (const [sessionId, data] of sessions) {
     if (now - data.createdAt > SESSION_TTL_MS) {
       expired.push({ sessionId, socketId: data.socketId, roomId: data.roomId });
-      sessions.delete(sessionId);
+      removeSession(sessionId);
     }
   }
   if (expired.length && typeof expireHandler === 'function') {

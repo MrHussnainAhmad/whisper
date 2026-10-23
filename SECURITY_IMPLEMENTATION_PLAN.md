@@ -1,3 +1,8 @@
+> Local implementation status (2026-10-22): see PHASE0_REPORT.md,
+> PHASE1_REPORT.md and PHASE1_PROGRESS.md. Those reports supersede historical
+> statements below about backend blocking, onion admission and endpoint TLS.
+> Mobile Tor integration and real onion deployment are still unverified.
+
 # One-to-one privacy implementation plan and next-session handoff
 
 > Superseded status, October 18, 2026: see SECURITY_HARDENING.md for current

@@ -1,5 +1,6 @@
 /** Layered abuse controls held only in this server process RAM. */
 const crypto = require('crypto');
+const { getOnionSource, isOnionRequest } = require('./torProxy');
 const proxyaddr = require('proxy-addr');
 const ipaddr = require('ipaddr.js');
 const { TRUST_PROXY_HOPS, trustProxy } = require('./networkConfig');
@@ -11,6 +12,7 @@ function positiveIntegerEnv(name, fallback) {
   return value;
 }
 const MAX_CONNECTIONS_PER_SOURCE = positiveIntegerEnv('MAX_CONNECTIONS_PER_SOURCE', 24);
+const ONION_CONNECTIONS_PER_CIRCUIT = positiveIntegerEnv('ONION_CONNECTIONS_PER_CIRCUIT', 4);
 const MAX_CONNECTIONS_GLOBAL = positiveIntegerEnv('MAX_CONNECTIONS_GLOBAL', 5000);
 const MAX_RATE_LIMIT_BUCKETS = positiveIntegerEnv('MAX_RATE_LIMIT_BUCKETS', 100_000);
 
@@ -58,6 +60,8 @@ function getSourceKey(socket) {
 }
 
 function computeSourceKey(socket) {
+  const onionSource = getOnionSource(socket.request);
+  if (onionSource !== undefined) return `onion:${onionSource}`;
   let address = socket.request?.socket?.remoteAddress || socket.handshake?.address || 'unknown';
   if (TRUST_PROXY_HOPS > 0 && socket.request) {
     try {
@@ -82,7 +86,7 @@ async function acquireConnection(socket) {
   }
   let sourceMembers = connections.get(sourceKey);
   if (!sourceMembers) sourceMembers = new Set();
-  if (sourceMembers.size >= MAX_CONNECTIONS_PER_SOURCE) {
+  if (sourceMembers.size >= (isOnionRequest(socket.request) ? ONION_CONNECTIONS_PER_CIRCUIT : MAX_CONNECTIONS_PER_SOURCE)) {
     recordSecurityEvent('connection-source-limit');
     return false;
   }
@@ -145,7 +149,7 @@ function consumeSession(socket, action, sessionId, limit, windowMs, cost) {
   return consumeFrom(store, `${action}:${sessionId}`, limit, windowMs, cost, Date.now());
 }
 
-async function allowAction(socket, action, options = {}) {
+function allowAction(socket, action, options = {}) {
   const limit = options.limit ?? 30;
   const sourceLimit = options.sourceLimit ?? limit;
   const windowMs = options.windowMs ?? 60_000;
@@ -154,17 +158,18 @@ async function allowAction(socket, action, options = {}) {
   const sessionId = socket.sessionId;
   if (!sourceKey || !sessionId || !Number.isFinite(cost) || cost < 1) return false;
 
+  // Reject abusive sockets before they can debit shared budgets.
+  const allowed = consumeSession(socket, action, sessionId, limit, windowMs, cost);
+  if (!allowed) { recordSecurityEvent('socket-rate-limited'); return false; }
+  if (sourceLimit !== false && !consumeMemory(`${action}:source`, sourceKey, sourceLimit, windowMs, cost)) {
+    recordSecurityEvent('socket-rate-limited');
+    return false;
+  }
   if (options.globalLimit && !consumeMemory(`${action}:global`, 'all', options.globalLimit, windowMs, cost)) {
     recordSecurityEvent('socket-global-rate-limited');
     return false;
   }
 
-  if (!consumeMemory(`${action}:source`, sourceKey, sourceLimit, windowMs, cost)) {
-    recordSecurityEvent('socket-rate-limited');
-    return false;
-  }
-  const allowed = consumeSession(socket, action, sessionId, limit, windowMs, cost);
-  if (!allowed) recordSecurityEvent('socket-rate-limited');
   return allowed;
 }
 

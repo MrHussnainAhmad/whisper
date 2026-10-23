@@ -1,60 +1,145 @@
-# Private relay deployment prerequisites
+# Phase 1 future deployment preparation
 
-Current deployment behavior (October 18, 2026): the mobile app uses direct
-HTTPS, not Tor. The topology below is a future architecture, not a description
-of the current service. See SECURITY_HARDENING.md in the repository root.
+These are local instructions/templates only. No service, host, firewall, Tor
+configuration, or production deployment has been accessed or changed. This file
+supersedes the earlier onion-over-loopback-TLS proposal in this directory.
+Standard mode keeps the existing independent public HTTPS endpoint and proxy.
 
-Production requires NODE_ENV=production. For a same-host reverse proxy, set
-TRUST_PROXY=1 and TRUST_PROXY_CIDRS=127.0.0.1/32,::1/128. Use the actual proxy
-CIDRs for other topologies and restrict inbound Node access to those proxies.
-The proxy must overwrite forwarding headers. Random one-to-one chat is enabled;
-public groups remain disabled. ALLOW_UNVERIFIED_CHATS is obsolete.
-Deploy the Phase 4X backend (commit 544d1db or a descendant) and restart its Node
-process together with updating the app. Updating local files does not update the
-running server. Earlier protocol-7 backends use incompatible longer invites and
-disable random chat; the protocol number alone does not establish compatibility.
-New native app builds are required for native changes.
+## Intended topology
 
-These are preparation files, not a deployed or verified Tor service.
+Future Tor-capable mobile client -> standard anonymous Tor v3 onion service ->
+C Tor PROXY v1 over protected Unix socket -> the existing Whisper Engine.IO,
+Socket.IO namespace, session store, matchmaking, and blind encrypted relay.
 
-The backend now binds to `127.0.0.1` unless `BIND_HOST` is explicitly set.
-For the planned onion service, keep the Node listener and TLS terminator private.
-Do not expose a parallel public chat endpoint or a gateway that forwards client IPs.
+The onion endpoint is `http://<56-character-v3-address>.onion:80` through Tor;
+its origin authentication/encryption comes from Tor and the correctly distributed
+onion address. The local Unix hop is trusted through OS permissions. It does not
+use the public domain, DuckDNS, a public certificate, or X-Forwarded-Proto.
+Ordinary public requests still require HTTPS in production. Never disable TLS
+verification for Standard mode. Never route a claimed onion request from a
+public TCP proxy into this Unix socket.
 
-Required topology:
+The backend has no SOCKS client, embedded Tor, bridge management, or mobile
+networking. The current Android application remains Standard-mode only. Browser
+Origin headers are rejected on the onion listener; this phase targets native
+clients. No client authorization is configured for the public onion address.
 
-`native mobile Tor client -> v3 onion service -> loopback TLS terminator -> loopback Node server`
+## Future Linux permissions and service setup (not executed)
 
-Use a real validated onion certificate with a documented renewal process. Do
-not use `rejectUnauthorized=false`, wildcard proxy trust, HTTP public gateways,
-or a clearnet bootstrap. TLS and onion provisioning are still outstanding.
+Use a dedicated backend account `whisper`, Tor account `debian-tor` (substitute
+that distribution's actual Tor account), and group `whisper-onion` containing
+only those two service accounts. Root remains trusted. Do not add other users.
+The backend owns the directory and socket. Tor may traverse/connect, but must
+not be allowed to replace the socket or directory. Restrict other processes
+running under these accounts too; PROXY v1 has no cryptographic authentication.
 
-The terminator must overwrite `X-Forwarded-Proto` and forwarding headers;
-restrict access so only that proxy can reach Node, and set `TRUST_PROXY` to
-the actual trusted topology. No access logs or request-body captures for chat.
-TLS termination, OS/service logs, provider backups, crash dumps, and swap must
-be inspected before release; application code alone cannot enforce those settings.
+Expected filesystem layout:
 
-All sessions, invites, room routing, and rate limits stay in the Node process
-RAM. No Redis/Valkey client, adapter, or external-state connection remains.
-Run exactly one Node process and one deployment replica; do not enable PM2
-cluster mode, autoscaling, or multiple workers. Independent processes cannot
-match users or share limits. Restarting loses temporary state and ends chats.
-No message history or attachment storage is added. Transport buffers can
-transiently carry ciphertext.
+| Path | Owner | Group | Mode |
+|---|---|---|---|
+| `/run/whisper-onion` | `whisper` | `whisper-onion` | `0750` |
+| `/run/whisper-onion/relay.sock` | `whisper` | `whisper-onion` | `0660` |
+| `/var/lib/tor/whisper` | Tor service user | Tor service group | `0700` |
 
-Remove obsolete REDIS_URL/VALKEY_URL secrets from the deployment environment.
-They are no longer used. Previously deployed services and any existing remote
-data must be retired separately; changing source does not delete provider data.
-Set host/container RAM limits and disable swap, core dumps, and memory snapshots
-for the sensitive process. Application RAM alone does not control host access.
+A future systemd backend unit should include the equivalent of:
 
-The existing source-IP admission logic needs redesign before Tor deployment:
-Tor connections converge on local/proxy addresses, and a per-source cap can
-incorrectly block the entire service. Do not solve this by adding original-IP
-forwarding. Use bounded anonymous admission/session budgets instead.
+```ini
+[Service]
+User=whisper
+Group=whisper-onion
+RuntimeDirectory=whisper-onion
+RuntimeDirectoryMode=0750
+UMask=0077
+Environment=NODE_ENV=production
+Environment=ONION_ENABLED=1
+Environment=ONION_SOCKET_PATH=/run/whisper-onion/relay.sock
+Environment=ONION_APP_POW_ENABLED=0
+# Keep existing ExecStart, public proxy settings, limits and hardening.
+```
 
-The current mobile release build connects directly over HTTPS using
-EXPO_PUBLIC_SERVER_URL. There is no anonymous-transport gate or Tor fallback.
-Do not advertise IP anonymity. Source tests are separate from inspection of
-the actual production proxy, host, logs, certificates and firewall.
+Give the separate Tor unit supplemental group `whisper-onion` (or add its service
+account to that group). Preserve its existing primary user/group. Service user
+names, unit names, sandbox mount visibility, AppArmor/SELinux policy and socket
+access must be verified on the eventual host. This is not a complete unit file.
+
+The backend validates every parent path: no symlink directories, no group/world
+writable ancestor, and a backend-owned final directory inaccessible to others.
+It does not create directories, add groups, or remove pre-existing socket paths.
+At bind it applies the directory's group and mode 0660, then enables acceptance.
+Before that, incoming sockets are rejected. Ordinary shutdown closes streams and
+lets Node remove its Unix socket. A stale path after a crash requires an operator
+to verify no live process owns it before removing that exact socket. Never use a
+blind startup `rm` or expose a TCP fallback. Windows activation fails explicitly.
+
+## Tor configuration
+
+Use [torrc.example](torrc.example) for a future dedicated C Tor service. The file
+sets v3 service storage, virtual port 80 to the Unix socket, circuit export,
+Tor's onion PoW, finite streams, and circuit closure on excessive streams. It
+opens no SOCKS or relay port. Keep normal anonymous service defaults: never
+set `HiddenServiceSingleHopMode` or `HiddenServiceNonAnonymousMode`.
+
+`HiddenServicePoWQueueRate 250` and `HiddenServicePoWQueueBurst 2500` are documented
+Tor defaults, not Whisper throughput claims. Tune to measured rendezvous demand,
+CPU/RAM and application budgets. The example `HiddenServiceMaxStreams 8` aligns
+with this backend's initial raw-stream ceiling; it is a deployment choice, not a
+universal security threshold. Account for multiple polling streams and upgrades.
+Check that the selected C Tor build supports onion PoW and all listed options;
+a future operator must validate the config with that installed version before
+activation. None of those validation/deployment commands were run here.
+
+Protect the onion service private keys in `HiddenServiceDir`; do not place them
+in this repository, app bundle, general logs, shared backups, or the backend
+account's readable directories. Make an encrypted offline backup under restricted
+operator custody and test recovery separately. Losing keys changes the address;
+key theft permits impersonation. Distribute/pin the intended onion address in a
+later coordinated mobile release. Circuit handles are not user identities.
+
+## Backend settings and resource boundaries
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ONION_ENABLED` | `0` | Only `1` enables the production Unix listener |
+| `ONION_SOCKET_PATH` | `/run/whisper-onion/relay.sock` | Absolute protected Unix socket path, at most 100 bytes |
+| `ONION_MAX_STREAMS` | `1000` | Total raw streams, including incomplete PROXY headers |
+| `ONION_MAX_PENDING` | `64` | Concurrent incomplete PROXY headers |
+| `ONION_STREAMS_PER_CIRCUIT` | `8` | Concurrent raw streams per circuit |
+| `ONION_PROXY_TIMEOUT_MS` | `2000` | PROXY deadline; maximum 10000 ms |
+| `ONION_MAX_CONNECTIONS` | `1000` | Onion Engine.IO cap, also bounded by half the existing global connection cap |
+| `ONION_CONNECTIONS_PER_CIRCUIT` | `4` | Engine.IO/Socket.IO circuit cap |
+| `ONION_APP_POW_ENABLED` | `0` | Optional application PoW, onion discovery only |
+| `ONION_APP_POW_BITS` | `16` | SHA-256 leading-zero difficulty, allowed 8 through 22 |
+
+Global and per-socket limits from Phase 0 are still enforced. Raw streams are
+bounded separately from established Engine.IO connections. The existing global
+connection ceiling covers both endpoint classes. Onion connections cannot occupy
+more than half that ceiling (minimum one); new public traffic retains its old
+limits. This does not reserve capacity against a distributed attacker using both
+endpoints. Established traffic retains Phase 0's reserved event budget and room
+allocation. Onion health/initial HTTP requests have separate fixed limits of
+120/circuit/minute and 6000/minute; valid session polling bypasses those initial
+request limits but still uses event/room limits. Circuit counters expire in RAM.
+
+A circuit switch cannot attach to an existing Engine.IO SID, even with valid
+HTTP headers. It must create a new anonymous session. The same circuit must be
+used across polling and WebSocket upgrade streams. Future mobile Tor integration
+must test that behavior; automatic circuit changes are not session resumption.
+Colliding/reused 32-bit handles can share temporary limits, and new circuits do
+not prove different users. Per-session blocking never uses these handles.
+
+## Future release checks
+
+Run local tests first, then separately validate Linux socket ownership/access,
+unauthorized local-user rejection, real C Tor header export, onion descriptor and
+PoW support, Socket.IO polling/upgrades over Tor, and mobile challenge handling.
+Use a controlled environment and obtain deployment authorization separately.
+Synthetic loopback tests do not establish that a real onion service works.
+Keep a single backend process/replica: all routing, rooms, quotas and tickets are
+RAM-only. Process restart ends chats. Inspect swap, crash dumps, infrastructure
+logs and backups independently; no application change can guarantee their policy.
+
+References checked for this implementation:
+- [Tor circuit export specification](https://spec.torproject.org/haproxy-proxy.html)
+- [Tor onion service setup](https://community.torproject.org/onion-services/setup/)
+- [Tor onion PoW documentation](https://onionservices.torproject.org/technology/pow/)
+- [Tor onion DoS guidance](https://community.torproject.org/onion-services/advanced/dos/)

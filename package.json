@@ -7,6 +7,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test --test-timeout=60000 test/*.test.js",
+    "test:integration": "node --test --test-timeout=60000 test/phase0.integration.test.js test/phase1.integration.test.js test/phase3.integration.test.js test/randomChat.test.js test/security.test.js test/transport.test.js",
     "audit:runtime": "npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {

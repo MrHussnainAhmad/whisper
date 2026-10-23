@@ -88,3 +88,23 @@ report.*.json
 *.swp
 *.swo
 *~
+
+# Keep backend security regression coverage reviewable.
+!test/
+test/*
+!test/*.test.js
+!test/*.cjs
+
+# Local assistant checkpoints and original task attachments (retain on disk).
+/PHASE*_PROGRESS.md
+/PHASE*_REQUIREMENTS.md
+/PUSH_CHECKPOINT.md
+
+# Local packages, backups and native build artifacts.
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.apk
+*.aab
+*.dmp

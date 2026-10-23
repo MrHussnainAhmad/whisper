@@ -44,9 +44,10 @@ See the mobile repository's SECURITY_PROTOCOL.md. Coordinate both releases;
 old installed clients and Expo Go cannot use protocol 7.
 Invite possession authenticates possession of the secret, not a real identity.
 
-The service currently uses direct HTTPS; it does not hide source IPs. Native
-anonymous transport and onion deployment remain unimplemented. The old Tor
-notes are a proposal. Rate limits must be redesigned for shared Tor ingress.
+Current mobile traffic uses direct HTTPS; it does not hide source IPs. Phase 1
+adds a disabled-by-default Unix/PROXY onion listener and circuit-based admission
+limits locally. Native Tor integration and a real onion deployment remain
+unverified. See PHASE1_REPORT.md and deployment/README.md for the current state.
 
 Public groups, if explicitly re-enabled, are server-readable. They are not a
 confidential group feature. Keep them disabled until a reviewed group protocol

@@ -1,0 +1,15 @@
+{
+  "environment": "Windows local loopback; synthetic v7 WebSocket; 256 ciphertext bytes; 5 batches of 25",
+  "node": "v24.21.0",
+  "ack": {
+    "samples": 125,
+    "medianMs": 2.0464999999999236,
+    "p95Ms": 3.6945000000005166
+  },
+  "delivery": {
+    "samples": 125,
+    "medianMs": 1.6796000000003914,
+    "p95Ms": 3.136800000000221
+  },
+  "notes": "Includes local client/network/event-loop time; not pure server duration or real Tor latency."
+}

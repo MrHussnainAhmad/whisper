@@ -10,6 +10,12 @@
  */
 
 const crypto = require('crypto');
+const phase3 = require('./phase3Config');
+const binaryRelay = require('./binaryRelay');
+const resumeManager = require('./sessionResume');
+const metrics = require('./performanceMetrics');
+const { proofOfWork } = require('./proofOfWork');
+const { isOnionRequest } = require('./torProxy');
 const {
   removeSession,
   getSession,
@@ -24,11 +30,13 @@ const {
   getRoomBySessionId,
   getPeerSocketId,
   destroyRoom,
+  lockRoomSecureChannel,
 } = require('./matchmaking');
 const { createInvite, getInvite, consumeInvite, cancelInvite, hasInvite, getInviteForRequest } = require('./invites');
 const { isValidInviteLocator, normalizeInviteLocator } = require('./inviteRateLimiter');
 const { isValidMessageId, isValidKeyBundle, isValidBase64 } = require('./validation');
 const { allowAction, MAX_CONNECTIONS_GLOBAL } = require('./abuseLimiter');
+const { allowRoomResource } = require('./roomLimiter');
 const { recordSecurityEvent } = require('./securityMonitor');
 const {
   createCaptcha,
@@ -77,16 +85,39 @@ function estimateBase64Bytes(b64) {
 function registerHandlers(io, socket) {
   ensureGroupStatusListener(io);
   socket.use((_packet, next) => {
-    allowAction(socket, 'all-events', { limit: 100, sourceLimit: 200, globalLimit: GLOBAL_EVENTS_PER_SECOND, windowMs: 1000 })
-      .then((allowed) => { if (allowed) next(); else socket.disconnect(true); })
+    if (!resumeManager.owns(socket) || !socket.connected) {
+      const ack = _packet.at(-1); if (typeof ack === 'function') ack({ok:false,error:'Stale connection'});
+      return;
+    }
+    const current = getRoomBySessionId(socket.sessionId);
+    const established = !!current?.room.secureChannelLocked;
+    const budget = Math.max(1, Math.floor(GLOBAL_EVENTS_PER_SECOND * (established ? 0.8 : 0.2)));
+    const reject = () => {
+      // Shared resource pressure must not terminate an established conversation.
+      if (!established) { socket.disconnect(true); return; }
+      const ack = _packet.at(-1);
+      if (typeof ack === 'function') ack({ ok: false, error: 'Server busy. Please wait.', retryable: true });
+    };
+    if (established && !allowRoomResource(current.room, 'events', budget, 1000, 1, 200)) {
+      reject(); return;
+    }
+    Promise.resolve(allowAction(socket, established ? 'established-events' : 'admission-events', {
+      limit: 100, sourceLimit: established ? false : 200, globalLimit: budget, windowMs: 1000,
+    }))
+      .then((allowed) => { if (allowed) next(); else reject(); })
       .catch(() => socket.disconnect(true));
   });
 
   let queueEpoch = 0, queueTimer;
+  socket.data.cancelSearchTimer = () => { queueEpoch++; clearTimeout(queueTimer); };
+  const notifyMatched = (socketId, roomId) => {
+    io.sockets.sockets.get(socketId)?.data.cancelSearchTimer?.();
+    io.to(socketId).emit('matched', { roomId });
+  };
   let pendingHandlers = 0;
   const on = (event, handler) => {
     socket.on(event, (...args) => {
-      // Never retain an unbounded queue of large packets behind async handlers.
+      // Never retain an unbounded queue of large packets behind handlers.
       if (event !== 'disconnect' && pendingHandlers >= 8) {
         recordSecurityEvent('socket-inflight-limit');
         socket.disconnect(true);
@@ -94,7 +125,14 @@ function registerHandlers(io, socket) {
       }
       pendingHandlers += 1;
       Promise.resolve()
-        .then(() => handler(...args))
+        .then(() => {
+          if (!resumeManager.owns(socket)) {
+            const ack = args.at(-1);
+            if (typeof ack === 'function') ack({ ok:false, error:'Stale connection' });
+            return;
+          }
+          return handler(...args);
+        })
         .catch((err) => {
           recordSecurityEvent('socket-handler-error');
           console.error(`Socket event ${event} failed`);
@@ -107,12 +145,65 @@ function registerHandlers(io, socket) {
         .finally(() => { pendingHandlers -= 1; });
     });
   };
-  const resetChatState = async () => {
+  on('negotiate-capabilities', (data, ack) => {
+    const session=getSession(socket.sessionId);
+    if(typeof ack!=='function') return;
+    if(!session || session.roomId || isInQueue(socket.sessionId)) { ack({ok:false,error:'Negotiate before matchmaking'}); return; }
+    session.capabilities={resume:phase3.resume && data?.resume===1, binary:phase3.binary && data?.binary===1};
+    ack({ok:true,...session.capabilities});
+  });
+  for(const [event,method] of [['resume-token','issue'],['resume-session','resume'],['resume-proof','proof'],['resume-confirm','confirm']]) {
+    on(event,(data,ack)=>{
+      if(typeof ack!=='function') return;
+      if(!allowAction(socket,'resume-control',{limit:20,sourceLimit:40,globalLimit:1000})) { ack({ok:false,error:'Rate limited'}); return; }
+      ack(resumeManager[method](io,socket,data));
+    });
+  }
+  on('room-capabilities',(_data,ack)=>{
+    const current=getRoomBySessionId(socket.sessionId);
+    if(typeof ack!=='function') return;
+    if(!current) {ack({ok:false,error:'Not in a chat'});return;}
+    const peers=[current.room.session1,current.room.session2].map(m=>getSession(m.sessionId)?.capabilities);
+    ack({ok:true,resume:phase3.resume && peers.every(c=>c?.resume),binary:phase3.binary && peers.every(c=>c?.binary)});
+  });
+  on('send-envelope',(data,ack)=>{ if(typeof ack==='function') binaryRelay.send(io,socket,data,ack); });
+  on('media-ack',(data,ack)=>{ if(typeof ack==='function') ack(binaryRelay.receipt(io,socket,data)); });
+  on('resume-status',(_data,ack)=>{
+    const current=getRoomBySessionId(socket.sessionId), state=current?.room.resumeState;
+    if(typeof ack==='function') ack(state ? {ok:true,roomId:current.roomId,pending:state.pending,epoch:state.epoch,challenge:state.challenge,generations:state.slots.map(s=>s.generation),deadline:state.deadline} : {ok:false,error:'Not resumable'});
+  });
+  const needsProof = () => !!proofOfWork && isOnionRequest(socket.request);
+  on('pow-challenge', (data, ack) => {
+    if (typeof ack !== 'function') return;
+    if (!needsProof()) { ack({ ok: false, error: 'Proof of work disabled' }); return; }
+    if (!(allowAction(socket, 'pow-issue', { limit: 6, sourceLimit: 12, globalLimit: 300 }))) {
+      ack({ ok: false, error: 'Rate limited', retryable: true }); return;
+    }
+    if (!socket.connected) return;
+    const challenge = proofOfWork.issue(socket.sessionId, data?.action);
+    ack(challenge ? { ok: true, challenge } : { ok: false, error: 'Challenge unavailable' });
+  });
+  on('pow-solve', (data, ack) => {
+    if (typeof ack !== 'function') return;
+    if (!needsProof()) { ack({ ok: false, error: 'Proof of work disabled' }); return; }
+    if (!(allowAction(socket, 'pow-verify', { limit: 12, sourceLimit: 24, globalLimit: 600 }))) {
+      ack({ ok: false, error: 'Rate limited', retryable: true }); return;
+    }
+    if (!socket.connected) return;
+    const ticket = proofOfWork.solve(socket.sessionId, data?.id, data?.solution);
+    ack(ticket ? { ok: true, ...ticket } : { ok: false, error: 'Invalid or expired proof' });
+  });
+  const admitOperation = (action, data, reply) => {
+    if (!needsProof() || proofOfWork.consume(data?.admissionTicket, action)) return true;
+    reply({ ok: false, error: 'Proof of work required', retryable: true });
+    return false;
+  };
+  const resetChatState = () => {
     socket.chatVerified = false;
     socket.data.publicKey = null;
     socket.data.keyConfirmationSent = false;
     socket.data.recentMessageIds = new Set();
-    if (socket.sessionId) await clearSessionPublicKey(socket.sessionId);
+    if (socket.sessionId) clearSessionPublicKey(socket.sessionId);
   };
   socket.data.keyConfirmationSent = false;
   const leaveGroupIfNeeded = () => {
@@ -131,13 +222,13 @@ function registerHandlers(io, socket) {
   /**
    * FIND RANDOM - Enter the matchmaking queue.
    */
-  on('find-random', async (data, ack) => {
+  on('find-random', (data, ack) => {
     if (typeof data === 'function') ack = data;
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const searchEpoch = ++queueEpoch;
     clearTimeout(queueTimer);
     const sessionId = socket.sessionId;
-    const session = sessionId ? await getSession(sessionId) : null;
+    const session = sessionId ? getSession(sessionId) : null;
     if (!sessionId || !session) {
       socket.emit('error', { message: 'Session not found' });
       reply({ ok: false, error: 'Session not found' });
@@ -150,25 +241,26 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'matchmaking', { limit: 10, sourceLimit: 20 }))) {
+    if (!(allowAction(socket, 'matchmaking', { limit: 10, sourceLimit: 20 }))) {
       socket.emit('error', { message: 'Too many requests. Please wait.' });
       reply({ ok: false, error: 'Too many requests. Please wait.' });
       return;
     }
+    if (!admitOperation('find-random', data, reply)) return;
     leaveGroupIfNeeded();
-    await resetChatState();
+    resetChatState();
 
-    if (await hasInvite(sessionId)) {
-      await cancelInvite(sessionId);
+    if (hasInvite(sessionId)) {
+      cancelInvite(sessionId);
     }
 
     if (searchEpoch !== queueEpoch || !socket.connected) { reply({ ok: false, error: 'Search cancelled' }); return; }
-    const match = joinQueue(sessionId, socket.id, socket.data.sourceKey);
+    const match = joinQueue(sessionId, socket.id);
 
     if (match) {
       const { roomId, user1, user2 } = match;
-      io.to(user1.socketId).emit('matched', { roomId });
-      io.to(user2.socketId).emit('matched', { roomId });
+      notifyMatched(user1.socketId, roomId);
+      notifyMatched(user2.socketId, roomId);
       reply({ ok: true, status: 'matched', roomId });
     } else {
       queueTimer = setTimeout(() => {
@@ -184,26 +276,26 @@ function registerHandlers(io, socket) {
   /**
    * CANCEL SEARCH - Leave the matchmaking queue.
    */
-  on('cancel-search', async () => {
+  on('cancel-search', () => {
     queueEpoch++; clearTimeout(queueTimer);
     const sessionId = socket.sessionId;
     if (!sessionId) return;
-    await leaveQueue(sessionId);
+    leaveQueue(sessionId);
     // If a match already happened, treat cancel as leaving the room
-    await handleDisconnectFromRoom(io, socket);
+    handleDisconnectFromRoom(io, socket);
   });
 
   /**
    * CREATE INVITE - Generate a one-time invite code.
    */
-  on('create-invite', async (data, ack) => {
+  on('create-invite', (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const requestId = data?.requestId;
     if (requestId !== undefined && !isValidMessageId(requestId)) {
       reply({ ok: false, error: 'Invalid invite request' }); return;
     }
     const sessionId = socket.sessionId;
-    const session = sessionId ? await getSession(sessionId) : null;
+    const session = sessionId ? getSession(sessionId) : null;
     if (!sessionId || !session) {
       socket.emit('error', { message: 'Session not found' });
       reply({ ok: false, error: 'Session not found' });
@@ -216,7 +308,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (await isInQueue(sessionId)) {
+    if (isInQueue(sessionId)) {
       socket.emit('error', { message: 'Cancel search before creating an invite' });
       reply({ ok: false, error: 'Cancel search before creating an invite' });
       return;
@@ -224,59 +316,60 @@ function registerHandlers(io, socket) {
 
     const existingLocator = getInviteForRequest(sessionId, requestId);
     if (existingLocator) { reply({ ok: true, locator: existingLocator }); return; }
-    if (!(await allowAction(socket, 'invite-create', {
+    if (!(allowAction(socket, 'invite-create', {
       limit: 5, sourceLimit: 10, windowMs: 300_000,
     }))) {
       socket.emit('error', { message: 'Too many invites. Please wait.' });
       reply({ ok: false, error: 'Too many invites. Please wait.' });
       return;
     }
+    if (!admitOperation('create-invite', data, reply)) return;
     leaveGroupIfNeeded();
-    await resetChatState();
+    resetChatState();
 
     const locator = createInvite(sessionId, socket.id, requestId);
     reply({ ok: true, locator });
   });
 
-  on('cancel-invite', async () => {
-    if (socket.sessionId) await cancelInvite(socket.sessionId);
+  on('cancel-invite', () => {
+    if (socket.sessionId) cancelInvite(socket.sessionId);
   });
 
-  on('group-captcha', async (data, ack) => {
+  on('group-captcha', (data, ack) => {
     if (typeof data === 'function') ack = data;
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     if (!ALLOW_UNVERIFIED_CHATS) { reply({ ok: false, error: 'Public group chat is disabled.' }); return; }
-    if (!(await allowAction(socket, 'group-captcha', { limit: 8, sourceLimit: 20 }))) {
+    if (!(allowAction(socket, 'group-captcha', { limit: 8, sourceLimit: 20 }))) {
       reply({ ok: false, error: 'Too many attempts. Please wait.' });
       return;
     }
     reply({ ok: true, captcha: createCaptcha() });
   });
 
-  on('group-status', async (data, ack) => {
+  on('group-status', (data, ack) => {
     if (typeof data === 'function') ack = data;
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
-    if (!(await allowAction(socket, 'group-status', { limit: 30, sourceLimit: 120 }))) {
+    if (!(allowAction(socket, 'group-status', { limit: 30, sourceLimit: 120 }))) {
       reply({ ok: false, error: 'Too many status requests. Please wait.' });
       return;
     }
     reply({ ok: true, ...getGroupStatus() });
   });
 
-  on('join-group', async (data, ack) => {
+  on('join-group', (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     if (!ALLOW_UNVERIFIED_CHATS) { reply({ ok: false, error: 'Public group chat is disabled.' }); return; }
     const sessionId = socket.sessionId;
-    const session = sessionId ? await getSession(sessionId) : null;
+    const session = sessionId ? getSession(sessionId) : null;
     if (!sessionId || !session) {
       reply({ ok: false, error: 'Session not found' });
       return;
     }
-    if (session.roomId || await isInQueue(sessionId)) {
+    if (session.roomId || isInQueue(sessionId)) {
       reply({ ok: false, error: 'Leave your current chat/search first.' });
       return;
     }
-    if (!(await allowAction(socket, 'group-join', {
+    if (!(allowAction(socket, 'group-join', {
       limit: 5, sourceLimit: 10, windowMs: 60_000,
     }))) {
       reply({ ok: false, error: 'Too many join attempts. Please wait.' });
@@ -292,9 +385,9 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    await resetChatState();
-    if (await hasInvite(sessionId)) await cancelInvite(sessionId);
-    await leaveQueue(sessionId);
+    resetChatState();
+    if (hasInvite(sessionId)) cancelInvite(sessionId);
+    leaveQueue(sessionId);
 
     const result = joinGroup(sessionId, socket.id, data?.username);
     if (!result.ok) {
@@ -320,9 +413,9 @@ function registerHandlers(io, socket) {
     io.emit('group-status', getGroupStatus());
   });
 
-  on('group-message', async (data, ack) => {
+  on('group-message', (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
-    if (!(await allowAction(socket, 'group-message-count', {
+    if (!(allowAction(socket, 'group-message-count', {
       limit: 20, sourceLimit: 40,
     }))) {
       reply({ ok: false, error: 'Too many messages. Please slow down.' });
@@ -343,7 +436,7 @@ function registerHandlers(io, socket) {
     reply({ ok: true, message: result.message });
   });
 
-  on('leave-group', async (ack) => {
+  on('leave-group', (ack) => {
     leaveGroupIfNeeded();
     if (typeof ack === 'function') ack({ ok: true });
   });
@@ -351,8 +444,8 @@ function registerHandlers(io, socket) {
   /**
    * JOIN INVITE - Redeem an invite code and start a chat.
    */
-  on('join-invite', async (data) => {
-    if (!(await allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10, globalLimit: GLOBAL_INVITE_JOINS_PER_MINUTE, windowMs: 60000 }))) {
+  on('join-invite', (data) => {
+    if (!(allowAction(socket, 'invite-join', { limit: 5, sourceLimit: 10, globalLimit: GLOBAL_INVITE_JOINS_PER_MINUTE, windowMs: 60000 }))) {
       socket.emit('error', { message: 'Too many attempts. Wait a minute and try again.' });
       return;
     }
@@ -360,7 +453,7 @@ function registerHandlers(io, socket) {
       ? normalizeInviteLocator(data.locator) : null;
     const sessionId = socket.sessionId;
 
-    const session = sessionId ? await getSession(sessionId) : null;
+    const session = sessionId ? getSession(sessionId) : null;
     if (!sessionId || !session) {
       socket.emit('error', { message: 'Session not found' });
       return;
@@ -371,7 +464,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (await isInQueue(sessionId)) {
+    if (isInQueue(sessionId)) {
       socket.emit('error', { message: 'Cancel search before joining an invite' });
       return;
     }
@@ -388,13 +481,13 @@ function registerHandlers(io, socket) {
 
 
 
-    const invite = await getInvite(locator);
+    const invite = getInvite(locator);
     if (!invite) {
       socket.emit('error', { message: 'Invite code not found or expired' });
       return;
     }
 
-    const inviterSession = await getSession(invite.sessionId);
+    const inviterSession = getSession(invite.sessionId);
     if (!inviterSession || inviterSession.roomId) {
       socket.emit('error', { message: 'Invite code not found or expired' });
       return;
@@ -406,13 +499,13 @@ function registerHandlers(io, socket) {
     }
 
     leaveGroupIfNeeded();
-    await resetChatState();
+    resetChatState();
 
-    await leaveQueue(invite.sessionId);
-    await leaveQueue(sessionId);
+    leaveQueue(invite.sessionId);
+    leaveQueue(sessionId);
 
     const roomId = crypto.randomUUID();
-    const roomResult = await _createInviteRoom(roomId, invite, sessionId, socket.id, locator);
+    const roomResult = _createInviteRoom(roomId, invite, sessionId, socket.id, locator);
     if (!roomResult.created) {
       socket.emit('error', { message: 'Invite is no longer available' });
       return;
@@ -420,21 +513,21 @@ function registerHandlers(io, socket) {
 
     const claimedInvite = roomResult.inviteConsumed
       ? invite
-      : await consumeInvite(locator, invite.sessionId);
+      : consumeInvite(locator, invite.sessionId);
     if (!claimedInvite) {
-      await destroyRoom(roomId);
+      destroyRoom(roomId);
       socket.emit('error', { message: 'Invite code not found or expired' });
       return;
     }
 
-    io.to(claimedInvite.socketId).emit('matched', { roomId });
-    io.to(socket.id).emit('matched', { roomId });
+    notifyMatched(claimedInvite.socketId, roomId);
+    notifyMatched(socket.id, roomId);
   });
 
   /**
    * KEY EXCHANGE - Relay public key to peer.
    */
-  on('key-exchange', async (data, ack) => {
+  on('key-exchange', (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     if (data?.protocolVersion !== 7) {
       socket.emit('error', { message: 'Update the app to establish this chat.' });
@@ -456,10 +549,18 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'key-exchange', { limit: 4, sourceLimit: 12 }))) {
+    if (!(allowAction(socket, 'key-exchange', { limit: 4, sourceLimit: 12 }))) {
       socket.emit('rate-limited', { action: 'key-exchange', retryAfterMs: 60_000 });
       reply({ ok: false, error: 'Rate limited' });
       return;
+    }
+
+    const roomData = getRoomBySessionId(sessionId);
+    if (!socket.connected || !roomData || getSession(sessionId)?.socketId !== socket.id) {
+      reply({ ok: false, error: 'Not in a chat' }); return;
+    }
+    if (roomData.room.secureChannelLocked) {
+      reply({ ok: false, error: 'Secure channel already established' }); return;
     }
 
     if (socket.data.publicKey && socket.data.publicKey !== publicKey) {
@@ -470,17 +571,10 @@ function registerHandlers(io, socket) {
     if (!socket.data.publicKey) {
       socket.data.publicKey = publicKey;
       socket.chatVerified = false;
-      await setSessionPublicKey(sessionId, publicKey);
+      setSessionPublicKey(sessionId, publicKey);
     }
 
-    const roomData = await getRoomBySessionId(sessionId);
-    if (!roomData) {
-      socket.emit('error', { message: 'Not in a chat' });
-      reply({ ok: false, error: 'Not in a chat' });
-      return;
-    }
-
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
+    const peerSocketId = getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) {
       // The key is registered; the peer receives it when it announces chat-ready.
       reply({ ok: true, relayed: false });
@@ -495,7 +589,7 @@ function registerHandlers(io, socket) {
    * KEY CONFIRMATION - Relay an encrypted proof that the sender derived the
    * same room-bound key. The relay cannot create or validate this proof.
    */
-  on('key-confirm', async (data, ack) => {
+  on('key-confirm', (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const sessionId = socket.sessionId;
     const proof = data?.proof;
@@ -510,18 +604,24 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Invalid key confirmation payload.' });
       return;
     }
-    if (!(await allowAction(socket, 'key-confirm', { limit: 4, sourceLimit: 12 }))) {
+    if (!(allowAction(socket, 'key-confirm', { limit: 4, sourceLimit: 12 }))) {
       socket.emit('rate-limited', { action: 'key-confirm', retryAfterMs: 60_000 });
       reply({ ok: false, error: 'Rate limited' });
       return;
     }
 
-    const roomData = await getRoomBySessionId(sessionId);
-    if (!roomData) { reply({ ok: false, error: 'Not in a chat' }); return; }
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
+    const roomData = getRoomBySessionId(sessionId);
+    if (!socket.connected || !roomData || getSession(sessionId)?.socketId !== socket.id) {
+      reply({ ok: false, error: 'Not in a chat' }); return;
+    }
+    if (roomData.room.secureChannelLocked) {
+      reply({ ok: false, error: 'Secure channel already established' }); return;
+    }
+
+    const peerSocketId = getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) { reply({ ok: false, error: 'Peer is unavailable', retryable: true }); return; }
 
-    await setSessionKeyConfirmed(sessionId);
+    setSessionKeyConfirmed(sessionId);
     socket.data.keyConfirmationSent = true;
     io.to(peerSocketId).emit('peer-key-confirm', { proof });
     reply({ ok: true });
@@ -530,7 +630,7 @@ function registerHandlers(io, socket) {
   /**
    * SEND ENCRYPTED - Relay an E2E encrypted message to the peer.
    */
-  on('send-encrypted', async (data, ack) => {
+  on('send-encrypted', (data, ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const sessionId = socket.sessionId;
     if (!sessionId) {
@@ -545,13 +645,15 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    const roomData = await getRoomBySessionId(sessionId);
+    const roomData = getRoomBySessionId(sessionId);
     if (!roomData) {
       socket.emit('error', { message: 'Not in a chat' });
       reply({ ok: false, error: 'Not in a chat' });
       return;
     }
 
+    if (!resumeManager.active(roomData.room)) { reply({ok:false,error:'Resume confirmation required',retryable:true}); return; }
+    const forwardingStarted = metrics.now();
     const { encrypted, messageId } = data || {};
     if (!isValidMessageId(messageId)) {
       recordSecurityEvent('invalid-message-id');
@@ -583,20 +685,24 @@ function registerHandlers(io, socket) {
     }
 
     // Includes encrypted receipts, typing, privacy policy and liveness traffic.
-    if (!(await allowAction(socket, 'message-count', { limit: 40, sourceLimit: 80, globalLimit: GLOBAL_MESSAGES_PER_SECOND, windowMs: 1000 }))) {
+    if (!(allowAction(socket, 'message-count', { limit: 40, sourceLimit: false, windowMs: 1000 }))) {
       reply({ ok: false, error: 'Too many messages. Please slow down.', retryable: true });
       return;
     }
 
-    if (!(await allowAction(socket, 'message-bytes', {
+    if (!(allowAction(socket, 'message-bytes', {
       limit: 8 * 1024 * 1024,
-      sourceLimit: 16 * 1024 * 1024,
-      globalLimit: GLOBAL_MESSAGE_BYTES_PER_SECOND,
+      sourceLimit: false,
       windowMs: 1000,
       cost: Math.max(1, encryptedBytes),
     }))) {
       reply({ ok: false, error: 'Bandwidth limit reached. Please wait.', retryable: true });
       return;
+    }
+
+    if (!allowRoomResource(roomData.room, 'messages', GLOBAL_MESSAGES_PER_SECOND, 1000, 1, 80) ||
+        !allowRoomResource(roomData.room, 'bytes', GLOBAL_MESSAGE_BYTES_PER_SECOND * 10, 10000, Math.max(1, encryptedBytes), 16 * 1024 * 1024)) {
+      reply({ ok: false, error: 'Room capacity reached. Please wait.', retryable: true }); return;
     }
 
     // Charge malformed traffic too, before scanning the full payload.
@@ -605,13 +711,13 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Invalid encrypted payload.' });
       return;
     }
-    const currentRoom = await getRoomBySessionId(sessionId);
+    const currentRoom = getRoomBySessionId(sessionId);
     if (!socket.connected || !socket.chatVerified ||
         currentRoom?.roomId !== roomData.roomId) {
       reply({ ok: false, error: 'Chat ended' });
       return;
     }
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
+    const peerSocketId = getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (!peerSocketId) {
       socket.emit('error', { message: 'Peer is unavailable' });
       reply({ ok: false, error: 'Peer is unavailable' });
@@ -626,12 +732,10 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Peer disconnected' });
       return;
     }
-    // Relay packets are ASCII JSON, so string length equals byte length.
-    let bufferedBytes = 0;
-    for (const packet of peer.conn.writeBuffer || []) {
-      bufferedBytes += typeof packet.data === 'string' ? packet.data.length : packet.data?.byteLength || 0;
-    }
+    const bufferedBytes = binaryRelay.buffered(peer);
+    metrics.record('pendingBytes', bufferedBytes);
     if (bufferedBytes + encrypted.length > 2 * 1024 * 1024) {
+      metrics.record('contention', 1);
       reply({ ok: false, error: 'Peer connection is busy', retryable: true });
       return;
     }
@@ -644,22 +748,24 @@ function registerHandlers(io, socket) {
       recentMessageIds.delete(recentMessageIds.values().next().value);
     }
     peer.emit('receive-encrypted', { encrypted, messageId });
+    metrics.record('forwardMs', metrics.now()-forwardingStarted);
     reply({ ok: true, messageId, duplicate: false });
   });
 
   // Typing and device privacy reports travel inside send-encrypted in v7.
   // There is deliberately no plaintext compatibility endpoint for them.
 
-  const handleChannelReady = async (ack) => {
+  const handleChannelReady = (ack) => {
     const reply = (response) => { if (typeof ack === 'function') ack(response); };
     const sessionId = socket.sessionId;
-    const roomData = sessionId ? await getRoomBySessionId(sessionId) : null;
+    const roomData = sessionId ? getRoomBySessionId(sessionId) : null;
     if (!sessionId || !roomData) {
       reply({ ok: false, error: 'Not in a chat' });
       return;
     }
+    if (!resumeManager.active(roomData.room)) { reply({ok:false,error:'Resume confirmation required'}); return; }
     if (socket.chatVerified) { reply({ ok: true }); return; }
-    if (!(await allowAction(socket, 'secure-channel-ready', { limit: 12, sourceLimit: 24 }))) {
+    if (!(allowAction(socket, 'secure-channel-ready', { limit: 12, sourceLimit: 24 }))) {
       reply({ ok: false, error: 'Rate limited' });
       return;
     }
@@ -667,11 +773,15 @@ function registerHandlers(io, socket) {
       reply({ ok: false, error: 'Key exchange incomplete' });
       return;
     }
-    const room = roomData.room;
+    const current = getRoomBySessionId(sessionId);
+    if (!socket.connected || current?.roomId !== roomData.roomId || getSession(sessionId)?.socketId !== socket.id) {
+      reply({ ok: false, error: 'Chat ended' }); return;
+    }
+    const room = current.room;
     const peerId = room.session1.sessionId === sessionId
       ? room.session2.sessionId
       : room.session1.sessionId;
-    const peerSession = await getSession(peerId);
+    const peerSession = getSession(peerId);
     if (!peerSession?.publicKey) {
       reply({ ok: false, error: 'Peer key exchange incomplete' });
       return;
@@ -681,6 +791,7 @@ function registerHandlers(io, socket) {
       return;
     }
 
+    lockRoomSecureChannel(current.roomId);
     socket.chatVerified = true;
     reply({ ok: true });
   };
@@ -693,33 +804,33 @@ function registerHandlers(io, socket) {
   /**
    * CHAT READY - Signal that the user has entered the Chat Screen.
    */
-  on('chat-ready', async () => {
+  on('chat-ready', () => {
     const sessionId = socket.sessionId;
     if (!sessionId) return;
-    if (!(await allowAction(socket, 'chat-ready', { limit: 10, sourceLimit: 20 }))) {
+    if (!(allowAction(socket, 'chat-ready', { limit: 10, sourceLimit: 20 }))) {
       socket.emit('rate-limited', { action: 'chat-ready', retryAfterMs: 60_000 });
       return;
     }
-    const roomData = await getRoomBySessionId(sessionId);
+    const roomData = getRoomBySessionId(sessionId);
     if (!roomData) return;
-    const peerSocketId = await getPeerSocketId(roomData.roomId, sessionId, roomData.room);
+    const peerSocketId = getPeerSocketId(roomData.roomId, sessionId, roomData.room);
     if (peerSocketId) io.to(peerSocketId).emit('peer-ready');
   });
 
   /**
    * REPORT - Report a user. Both users are disconnected and the room is destroyed.
    */
-  on('block-peer', async (_data, ack) => {
-    if (!(await allowAction(socket, 'block-peer', { limit: 10, sourceLimit: 20 }))) { ack?.({ ok: false, error: 'Too many requests' }); return; }
+  on('block-peer', (_data, ack) => {
+    if (!(allowAction(socket, 'block-peer', { limit: 10, sourceLimit: 20 }))) { ack?.({ ok: false, error: 'Too many requests' }); return; }
     const current = getRoomBySessionId(socket.sessionId);
     if (!current) { ack?.({ ok: false, error: 'Chat ended' }); return; }
     const peer = current.room.session1.sessionId === socket.sessionId ? current.room.session2 : current.room.session1;
-    blockPair(socket.data.sourceKey, io.sockets.sockets.get(peer.socketId)?.data.sourceKey || peer.sessionId);
+    blockPair(socket.sessionId, peer.sessionId);
     destroyRoom(current.roomId);
     io.to(peer.socketId).emit('chat-ended', { reasonCode: 'peer_left' });
     ack?.({ ok: true });
   });
-  on('report', async (data, ack) => {
+  on('report', (data, ack) => {
     if (!['spam', 'abuse', 'other'].includes(data?.category)) { if (typeof ack === 'function') ack({ ok: false }); return; }
     const sessionId = socket.sessionId;
     if (!sessionId) {
@@ -727,13 +838,13 @@ function registerHandlers(io, socket) {
       return;
     }
 
-    if (!(await allowAction(socket, 'report', { limit: 3, sourceLimit: 5, windowMs: 300_000 }))) {
+    if (!(allowAction(socket, 'report', { limit: 3, sourceLimit: 5, windowMs: 300_000 }))) {
       socket.emit('rate-limited', { action: 'report', retryAfterMs: 300_000 });
       socket.emit('error', { message: 'Too many reports. Please wait.' });
       return;
     }
 
-    const roomData = await getRoomBySessionId(sessionId);
+    const roomData = getRoomBySessionId(sessionId);
     if (!roomData) {
       socket.emit('error', { message: 'Not in a chat' });
       return;
@@ -741,13 +852,13 @@ function registerHandlers(io, socket) {
 
     const { roomId } = roomData;
     const other = roomData.room.session1.sessionId === sessionId ? roomData.room.session2 : roomData.room.session1;
-    blockPair(socket.data.sourceKey, io.sockets.sockets.get(other.socketId)?.data.sourceKey || other.sessionId);
+    blockPair(sessionId, other.sessionId);
     recordSecurityEvent('report-' + data.category);
-    const peerSocketId = await getPeerSocketId(roomId, sessionId, roomData.room);
+    const peerSocketId = getPeerSocketId(roomId, sessionId, roomData.room);
     socket.emit('chat-ended', { reasonCode: 'reported' });
     if (peerSocketId) io.to(peerSocketId).emit('chat-ended', { reasonCode: 'reported' });
 
-    await destroyRoom(roomId);
+    destroyRoom(roomId);
     if (typeof ack === 'function') ack({ ok: true });
   });
 
@@ -756,7 +867,7 @@ function registerHandlers(io, socket) {
    * Clears every chat-scoped record for this session. The session entry itself
    * belongs to the still-open connection and is removed on disconnect.
    */
-  on('leave-room', async (data, ack) => {
+  on('leave-room', (data, ack) => {
     if (typeof data === 'function') ack = data;
     queueEpoch++; clearTimeout(queueTimer);
     const sessionId = socket.sessionId;
@@ -765,24 +876,27 @@ function registerHandlers(io, socket) {
       cancelInvite(sessionId);
     }
     leaveGroupIfNeeded();
-    await handleDisconnectFromRoom(io, socket);
-    await resetChatState();
+    handleDisconnectFromRoom(io, socket);
+    resetChatState();
     if (typeof ack === 'function') ack({ ok: true });
   });
 
   /**
    * DISCONNECT - Socket disconnected (app closed, network lost, etc.).
    */
-  on('disconnect', async () => {
-    queueEpoch++; clearTimeout(queueTimer); forgetBlocks(socket.sessionId);
+  on('disconnect', () => {
+    queueEpoch++; clearTimeout(queueTimer);
+    if (resumeManager.suspend(io, socket)) return;
+    forgetBlocks(socket.sessionId);
+    proofOfWork?.forget(socket.sessionId);
     const sessionId = socket.sessionId;
     if (!sessionId) return;
 
-    await leaveQueue(sessionId);
-    await cancelInvite(sessionId);
+    leaveQueue(sessionId);
+    cancelInvite(sessionId);
     leaveGroupIfNeeded();
-    await handleDisconnectFromRoom(io, socket);
-    await removeSession(sessionId);
+    handleDisconnectFromRoom(io, socket);
+    removeSession(sessionId);
   });
 }
 
@@ -790,19 +904,19 @@ function registerHandlers(io, socket) {
  * Handle disconnect from an active room.
  * Notifies the peer and destroys the room.
  */
-async function handleDisconnectFromRoom(io, socket) {
+function handleDisconnectFromRoom(io, socket) {
   socket.chatVerified = false;
   socket.data.recentMessageIds?.clear();
   const sessionId = socket.sessionId;
   if (!sessionId) return;
 
-  const roomData = await getRoomBySessionId(sessionId);
+  const roomData = getRoomBySessionId(sessionId);
   if (!roomData) return;
 
   const { roomId } = roomData;
-  const peerSocketId = await getPeerSocketId(roomId, sessionId, roomData.room);
+  const peerSocketId = getPeerSocketId(roomId, sessionId, roomData.room);
 
-  await destroyRoom(roomId);
+  destroyRoom(roomId);
   if (peerSocketId) {
     io.to(peerSocketId).emit('chat-ended', {
       reasonCode: 'peer_left',
@@ -814,7 +928,7 @@ async function handleDisconnectFromRoom(io, socket) {
 /**
  * Helper to create a room from an invite match.
  */
-async function _createInviteRoom(roomId, invite, joinerId, joinerSocketId, locator) {
+function _createInviteRoom(roomId, invite, joinerId, joinerSocketId, locator) {
   const matchmaking = require('./matchmaking');
   const room = {
     session1: { sessionId: invite.sessionId, socketId: invite.socketId },

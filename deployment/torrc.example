@@ -1,8 +1,18 @@
-# Preparation only: no service is provisioned by this file.
-# Use a dedicated Tor user and protect its data directory/service private key.
-# The TLS terminator at 127.0.0.1:8443 must have a valid certificate for the
-# generated v3 onion hostname. Never disable certificate validation in clients.
+# Future deployment template only. NOT installed or executed by Phase 1.
+# Run C Tor as its own service user, with onion PoW support in the selected build.
 SocksPort 0
+ORPort 0
+DirPort 0
 HiddenServiceDir /var/lib/tor/whisper/
 HiddenServiceVersion 3
-HiddenServicePort 443 127.0.0.1:8443
+HiddenServicePort 80 unix:/run/whisper-onion/relay.sock
+HiddenServiceExportCircuitID haproxy
+HiddenServicePoWDefensesEnabled 1
+# Tor documented queue defaults: starting points, not measured Whisper capacity.
+HiddenServicePoWQueueRate 250
+HiddenServicePoWQueueBurst 2500
+# Example stream ceiling aligned with ONION_STREAMS_PER_CIRCUIT=8; tune together.
+HiddenServiceMaxStreams 8
+HiddenServiceMaxStreamsCloseCircuit 1
+# Keep ordinary anonymous onion service behavior. Do NOT add SingleHopMode,
+# NonAnonymousMode, client authorization, an exit policy, or relay listeners.

@@ -24,6 +24,7 @@ const MAX_BLOCKED_PAIRS = (() => {
 const waitingQueue = new Map();
 const rooms = new Map();
 const sessionRooms = new Map();
+let establishedRooms = 0;
 
 const blockedPairs = new Map();
 const blocksById = new Map();
@@ -99,7 +100,7 @@ cleanupTimer.unref();
  * Add a user to the random matchmaking queue.
  * Returns a match object if two users are now waiting, otherwise null.
  */
-function joinQueue(sessionId, socketId, sourceKey = sessionId) {
+function joinQueue(sessionId, socketId) {
   const now = Date.now();
   const session = getSession(sessionId);
   if (!session || session.socketId !== socketId || session.roomId) return null;
@@ -110,16 +111,16 @@ function joinQueue(sessionId, socketId, sourceKey = sessionId) {
   let user1 = null;
   for (const [waitingId, item] of waitingQueue) {
     if (!isQueueEntryLive(item, now)) { waitingQueue.delete(waitingId); continue; }
-    if (isBlocked(item.sourceKey, sourceKey, now)) continue;
+    if (isBlocked(item.sessionId, sessionId, now)) continue;
     user1 = item;
     break;
   }
   if (!user1) {
-    waitingQueue.set(sessionId, { sessionId, socketId, sourceKey, queuedAt: now });
+    waitingQueue.set(sessionId, { sessionId, socketId, queuedAt: now });
     return null;
   }
   waitingQueue.delete(user1.sessionId);
-  const user2 = { sessionId, socketId, sourceKey };
+  const user2 = { sessionId, socketId };
   const roomId = crypto.randomUUID();
   if (!setRoomIfSessionsAvailable(roomId, { session1: user1, session2: user2 })) return null;
   return { roomId, user1, user2 };
@@ -191,11 +192,17 @@ function destroyRoom(roomId) {
   if (!room) return null;
 
   rooms.delete(roomId);
+  for (const cleanup of room.cleanupCallbacks || []) cleanup();
+  room.cleanupCallbacks?.clear();
+  if (room.secureChannelLocked) establishedRooms -= 1;
   for (const { sessionId } of [room.session1, room.session2]) {
     if (sessionRooms.get(sessionId) === roomId) sessionRooms.delete(sessionId);
   }
   clearSessionRoom(room.session1.sessionId, roomId);
   clearSessionRoom(room.session2.sessionId, roomId);
+  for (const member of [room.session1, room.session2]) {
+    if (getSession(member.sessionId)?.socketId === null) require('./sessions').removeSession(member.sessionId);
+  }
   return room;
 }
 
@@ -208,6 +215,20 @@ function getQueueSize() {
 
 function getRoomCount() {
   return rooms.size;
+}
+
+function lockRoomSecureChannel(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return false;
+  if (!room.secureChannelLocked) {
+    room.secureChannelLocked = true;
+    establishedRooms += 1;
+  }
+  return true;
+}
+
+function getEstablishedRoomCount() {
+  return establishedRooms;
 }
 
 /**
@@ -232,7 +253,7 @@ function _setInviteRoom(roomId, room, locator, expectedInviterSessionId) {
 }
 
 function setRoomIfSessionsAvailable(roomId, room) {
-  if (rooms.has(roomId)) return false;
+  if (rooms.has(roomId) || isBlocked(room.session1.sessionId, room.session2.sessionId, Date.now())) return false;
   const first = getSession(room.session1.sessionId);
   const second = getSession(room.session2.sessionId);
   if (first?.socketId !== room.session1.socketId || second?.socketId !== room.session2.socketId) return false;
@@ -254,6 +275,8 @@ module.exports = {
   destroyRoom,
   getQueueSize,
   getRoomCount,
+  getEstablishedRoomCount,
+  lockRoomSecureChannel,
   _setRoom,
   _setInviteRoom,
 };

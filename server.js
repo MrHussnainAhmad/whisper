@@ -33,6 +33,11 @@ const {
 } = require('./matchmaking');
 const { cancelInvite } = require('./invites');
 
+const { isOnionRequest, getOnionSource } = require('./torProxy');
+const { onionConfig, createOnionBoundary, listenOnion } = require('./onionListener');
+const { createOnionHttp } = require('./onionHttp');
+const onionSettings = onionConfig();
+
 const PORT = process.env.PORT || 3000;
 const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 const LISTEN_BACKLOG = (() => {
@@ -67,11 +72,25 @@ const io = new Server(server, {
   httpCompression: false,
 });
 
+const onionHttp = createOnionHttp(io);
+let onionBoundary;
+// Pin every polling/upgrade request to its original transport class and circuit.
+// A circuit change starts a new anonymous session; this is not resumption.
+io.engine.use((req, res, next) => {
+  const original = req._query?.sid && io.engine.clients[req._query.sid]?.request;
+  if (original && (isOnionRequest(original) !== isOnionRequest(req) ||
+      getOnionSource(original) !== getOnionSource(req))) {
+    return next(new Error('Transport changed'));
+  }
+  if (isOnionRequest(req)) return onionHttp.gate(req, res, next);
+  next();
+});
+
 // Engine.IO bypasses Express routes. Apply transport checks to polling and
 // WebSocket upgrade requests as well as the initial handshake.
 io.engine.use(requireHttps);
 io.engine.use(securityHeaders);
-io.engine.use((req, res, next) => req._query?.sid ? next() : httpRateLimit(req, res, next));
+io.engine.use((req, res, next) => isOnionRequest(req) || req._query?.sid ? next() : httpRateLimit(req, res, next));
 io.engine.on('connection', transportAdmission.onConnection);
 
 /**
@@ -89,6 +108,7 @@ async function handleExpiredSessions(expired) {
       }
     }
 
+    require('./proofOfWork').proofOfWork?.forget(sessionId);
     await leaveQueue(sessionId);
     await cancelInvite(sessionId);
 
@@ -161,6 +181,10 @@ io.on('connection', async (socket) => {
 });
 
 async function start() {
+  if (onionSettings.enabled) {
+    onionBoundary = createOnionBoundary(onionHttp.server, onionSettings);
+    await listenOnion(onionBoundary, onionSettings);
+  }
   startSecurityMonitoring();
 
   server.listen(PORT, BIND_HOST, LISTEN_BACKLOG, () => {
@@ -172,7 +196,7 @@ async function start() {
   });
 }
 
-start().catch((err) => {
+if (require.main === module) start().catch((err) => {
   console.error('Failed to start server:', err?.message || err);
   process.exit(1);
 });
@@ -188,11 +212,11 @@ async function shutdown(signal) {
   console.log(`Received ${signal}, shutting down...`);
   const forceExitTimer = setTimeout(() => process.exit(1), 5000);
   stopSecurityMonitoring();
-  io.close();
-  server.close(() => {
-    clearTimeout(forceExitTimer);
-    process.exit(0);
-  });
+  require('./proofOfWork').proofOfWork?.close();
+  await onionBoundary?.close();
+  await io.close();
+  clearTimeout(forceExitTimer);
+  process.exit(0);
 }
 
 process.on('SIGINT', () => { shutdown('SIGINT').catch((err) => {
@@ -203,3 +227,5 @@ process.on('SIGTERM', () => { shutdown('SIGTERM').catch((err) => {
   console.error('Shutdown failed:', err?.message || err);
   process.exit(1);
 }); });
+
+module.exports = { start, server, io, onionHttp };

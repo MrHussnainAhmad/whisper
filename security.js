@@ -6,6 +6,7 @@
  */
 
 // Production HTTPS enforcement cannot be disabled by environment flags.
+const { isOnionRequest } = require('./torProxy');
 const ENFORCE_HTTPS = process.env.NODE_ENV === 'production';
 const { trustProxy } = require('./networkConfig');
 
@@ -21,7 +22,7 @@ function isSecureRequest(req) {
 }
 
 function requireHttps(req, res, next) {
-  if (!ENFORCE_HTTPS || isSecureRequest(req)) {
+  if (isOnionRequest(req) || !ENFORCE_HTTPS || isSecureRequest(req)) {
     return next();
   }
   res.statusCode = 403;
@@ -46,7 +47,7 @@ function securityHeaders(req, res, next) {
 function requireSecureSocket(socket, next) {
   if (!ENFORCE_HTTPS) return next();
   const req = socket.request;
-  if (isSecureRequest(req)) return next();
+  if (isOnionRequest(req) || isSecureRequest(req)) return next();
   return next(new Error('HTTPS required'));
 }
 

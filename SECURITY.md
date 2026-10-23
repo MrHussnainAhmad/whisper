@@ -9,22 +9,25 @@ database URLs in a report.
 ## Current relay behavior
 
 ### Network metadata and IP addresses
-The relay is not a zero-metadata service and does not provide network
-anonymity. It necessarily observes each connection's IP address (or the
-`TRUST_PROXY` forwarded address), connection timing, and traffic volume, and so
-can any hosting or network provider in front of it. Clients connect directly
-over HTTPS. Whisper does not route traffic through Tor; the onion-service
-topology in `deployment/README.md` is a plan, not the current deployment.
+The Standard-mode endpoint observes source IPs (or explicitly trusted proxy
+addresses), timing and traffic volume. Current mobile clients still use direct
+HTTPS. Phase 1 adds a disabled-by-default local onion listener; this is not a
+claim that a real onion service is deployed or that mobile traffic uses Tor.
+See `PHASE1_REPORT.md` and `deployment/README.md` for the boundary and test limits.
 
-For connection caps, rate limits, and Block/Skip/Report pair blocks, the relay
-does not keep the raw address in its own records. `abuseLimiter.js` derives an
-HMAC-SHA-256 label from the address (IPv4 as-is, IPv6 grouped by /64) under a
-32-byte key generated randomly at process start and never persisted. These
-labels exist only in process RAM: rate-limit buckets for their window (normally
-one second to five minutes, then swept), connection-cap entries
-until disconnect, and pair blocks for 30 minutes. A restart discards them, and
-a new key makes old labels unlinkable. The raw address remains in OS and Node
-socket state while connected. Production does not log per-connection events.
+Public connection/admission limits use process-keyed HMAC source labels (IPv4
+addresses and IPv6 /64s). Onion limits use separate process-keyed labels derived
+from the circuit handle exported over the protected Unix/PROXY boundary, never
+from HTTP forwarding headers. Labels are temporary resource handles, not users.
+Counters expire in memory and connection entries are released on disconnect.
+Block/report relationships instead use random anonymous session UUIDs; they do
+not use IP or circuit labels. Blocks end on session removal, TTL expiry, bounded
+store eviction or restart. Fresh sessions cannot reliably identify a blocked peer.
+
+The raw public IP remains in OS/Node socket state while connected. The onion
+backend does not receive a client IP from Tor; it still observes pairings and
+traffic timing/volume. No circuit handles are emitted, logged or persisted by
+the application. Production does not log per-connection events;
 `securityMonitor.js` logs only aggregate event counts.
 
 ### Sessions and rooms
